@@ -1070,8 +1070,443 @@ app.post('/sync/webhook', async (req, res) => {
 /**
  * Ruta principal que Cloud Run health check requiere
  */
+// Endpoint raíz para health checks - VERSIÓN MEJORADA
 app.get('/', (req, res) => {
-    res.status(200).send('✅ Servicio de sincronización Drive to GCS activo');
+    const currentTime = new Date().toISOString();
+    const formattedTime = new Date().toLocaleString('es-ES', {
+        weekday: 'long',
+        year: 'numeric',
+        month: 'long',
+        day: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        timeZone: 'America/Bogota'
+    });
+
+    const html = `
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TalentHub Sync Service</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            color: #333;
+        }
+
+        .container {
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            width: 90%;
+            max-width: 1200px;
+            overflow: hidden;
+            margin: 20px;
+        }
+
+        .header {
+            background: linear-gradient(135deg, #1a237e 0%, #283593 100%);
+            color: white;
+            padding: 40px;
+            text-align: center;
+            position: relative;
+        }
+
+        .header::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 4px;
+            background: linear-gradient(90deg, #00bcd4, #4caf50);
+        }
+
+        .logo {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+
+        .logo-icon {
+            font-size: 48px;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0% { transform: scale(1); }
+            50% { transform: scale(1.1); }
+            100% { transform: scale(1); }
+        }
+
+        h1 {
+            font-size: 2.5rem;
+            margin-bottom: 10px;
+            font-weight: 600;
+        }
+
+        .tagline {
+            font-size: 1.2rem;
+            opacity: 0.9;
+            margin-bottom: 30px;
+        }
+
+        .status-badge {
+            display: inline-block;
+            background: #4caf50;
+            color: white;
+            padding: 8px 24px;
+            border-radius: 50px;
+            font-weight: 600;
+            font-size: 1.1rem;
+            box-shadow: 0 4px 15px rgba(76, 175, 80, 0.3);
+        }
+
+        .content {
+            padding: 40px;
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 30px;
+            margin-bottom: 40px;
+        }
+
+        .card {
+            background: #f8f9fa;
+            border-radius: 15px;
+            padding: 25px;
+            border-left: 4px solid #1a237e;
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
+        }
+
+        .card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.1);
+        }
+
+        .card h3 {
+            color: #1a237e;
+            margin-bottom: 15px;
+            font-size: 1.3rem;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .card-icon {
+            font-size: 24px;
+        }
+
+        .info-item {
+            margin-bottom: 12px;
+            padding-bottom: 12px;
+            border-bottom: 1px solid #e0e0e0;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .info-label {
+            font-weight: 600;
+            color: #555;
+        }
+
+        .info-value {
+            color: #333;
+            font-family: 'Courier New', monospace;
+        }
+
+        .endpoints {
+            background: #1a237e;
+            color: white;
+            padding: 30px;
+            border-radius: 15px;
+            margin-top: 30px;
+        }
+
+        .endpoints h3 {
+            margin-bottom: 20px;
+            font-size: 1.4rem;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .endpoint-item {
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 10px;
+            padding: 15px;
+            margin-bottom: 15px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            transition: background 0.3s ease;
+        }
+
+        .endpoint-item:hover {
+            background: rgba(255, 255, 255, 0.2);
+        }
+
+        .method {
+            padding: 5px 15px;
+            border-radius: 20px;
+            font-weight: 600;
+            font-size: 0.9rem;
+        }
+
+        .method.get { background: #4caf50; color: white; }
+        .method.post { background: #ff9800; color: white; }
+        .path { font-family: 'Courier New', monospace; }
+
+        .footer {
+            text-align: center;
+            padding: 30px;
+            color: #666;
+            border-top: 1px solid #e0e0e0;
+            margin-top: 40px;
+        }
+
+        .uptime {
+            display: inline-block;
+            background: #e3f2fd;
+            color: #1a237e;
+            padding: 10px 20px;
+            border-radius: 10px;
+            font-weight: 600;
+            margin-top: 15px;
+        }
+
+        @media (max-width: 768px) {
+            .container {
+                margin: 10px;
+                width: 95%;
+            }
+            
+            .header {
+                padding: 30px 20px;
+            }
+            
+            .content {
+                padding: 20px;
+            }
+            
+            .grid {
+                grid-template-columns: 1fr;
+            }
+            
+            h1 {
+                font-size: 2rem;
+            }
+        }
+    </style>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <div class="logo">
+                <div class="logo-icon">🔄</div>
+                <div>
+                    <h1>TalentHub Sync Service</h1>
+                    <div class="tagline">Sincronización automatizada Drive → Google Cloud Storage</div>
+                </div>
+            </div>
+            <div class="status-badge">
+                <i class="fas fa-check-circle"></i> Servicio Activo
+            </div>
+        </div>
+        
+        <div class="content">
+            <div class="grid">
+                <div class="card">
+                    <h3><i class="fas fa-info-circle card-icon"></i> Información del Servicio</h3>
+                    <div class="info-item">
+                        <span class="info-label">Estado:</span>
+                        <span class="info-value" style="color: #4caf50; font-weight: 600;">
+                            <i class="fas fa-check-circle"></i> Operacional
+                        </span>
+                    </div>
+                    <div class="info-item">
+                        <span class="info-label">Versión:</span>
+                        <span class="info-value">1.0.0</span>
+                    </div>
+                    <div class="info-item">
+                        <span class="info-label">Última actualización:</span>
+                        <span class="info-value">${formattedTime}</span>
+                    </div>
+                    <div class="info-item">
+                        <span class="info-label">Entorno:</span>
+                        <span class="info-value">${process.env.NODE_ENV || 'development'}</span>
+                    </div>
+                </div>
+                
+                <div class="card">
+                    <h3><i class="fas fa-database card-icon"></i> Configuración</h3>
+                    <div class="info-item">
+                        <span class="info-label">Proyecto GCP:</span>
+                        <span class="info-value">${GOOGLE_CLOUD_PROJECT}</span>
+                    </div>
+                    <div class="info-item">
+                        <span class="info-label">Bucket GCS:</span>
+                        <span class="info-value">${BUCKET_NAME}</span>
+                    </div>
+                    <div class="info-item">
+                        <span class="info-label">Carpeta Drive:</span>
+                        <span class="info-value">${ROOT_FOLDER_ID}</span>
+                    </div>
+                    <div class="info-item">
+                        <span class="info-label">Puerto:</span>
+                        <span class="info-value">${PORT}</span>
+                    </div>
+                </div>
+                
+                <div class="card">
+                    <h3><i class="fas fa-chart-line card-icon"></i> Estadísticas</h3>
+                    <div class="info-item">
+                        <span class="info-label">Modo sincronización:</span>
+                        <span class="info-value">${WEBHOOK_URL ? 'Webhook + Polling' : 'Polling'}</span>
+                    </div>
+                    <div class="info-item">
+                        <span class="info-label">Intervalo polling:</span>
+                        <span class="info-value">${POLLING_INTERVAL / 1000} segundos</span>
+                    </div>
+                    <div class="info-item">
+                        <span class="info-label">Sincronización:</span>
+                        <span class="info-value">${WEBHOOK_URL ? '<span style="color:#4caf50;">Tiempo real</span>' : '<span style="color:#ff9800;">Programada</span>'}</span>
+                    </div>
+                    <div class="info-item">
+                        <span class="info-label">Monitoreo:</span>
+                        <span class="info-value"><span style="color:#4caf50;">Activo</span></span>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="endpoints">
+                <h3><i class="fas fa-plug card-icon"></i> Endpoints Disponibles</h3>
+                
+                <div class="endpoint-item">
+                    <div>
+                        <span class="method get">GET</span>
+                        <span class="path">/</span>
+                    </div>
+                    <span>Health Check (esta página)</span>
+                </div>
+                
+                <div class="endpoint-item">
+                    <div>
+                        <span class="method post">POST</span>
+                        <span class="path">/sync</span>
+                    </div>
+                    <span>Sincronización manual Drive → GCS</span>
+                </div>
+                
+                <div class="endpoint-item">
+                    <div>
+                        <span class="method get">GET</span>
+                        <span class="path">/debug/storage</span>
+                    </div>
+                    <span>Diagnóstico de Google Cloud Storage</span>
+                </div>
+                
+                ${WEBHOOK_URL ? `
+                <div class="endpoint-item">
+                    <div>
+                        <span class="method post">POST</span>
+                        <span class="path">/sync/webhook</span>
+                    </div>
+                    <span>Webhook Drive (sincronización tiempo real)</span>
+                </div>
+                ` : ''}
+                
+                <div class="endpoint-item">
+                    <div>
+                        <span class="method get">GET</span>
+                        <span class="path">/sync/scheduled</span>
+                    </div>
+                    <span>Health Check programado</span>
+                </div>
+            </div>
+        </div>
+        
+        <div class="footer">
+            <p>TalentHub Sync Service © ${new Date().getFullYear()} - Sistema de sincronización automatizada</p>
+            <p class="uptime">
+                <i class="fas fa-clock"></i> Último check: ${new Date().toLocaleTimeString('es-ES')}
+            </p>
+            <p style="margin-top: 15px; font-size: 0.9rem;">
+                <i class="fas fa-shield-alt"></i> Servicio seguro | 
+                <i class="fas fa-bolt"></i> Alta disponibilidad | 
+                <i class="fas fa-sync-alt"></i> Sincronización continua
+            </p>
+        </div>
+    </div>
+    
+    <script>
+        // Actualizar la hora automáticamente cada minuto
+        function updateTime() {
+            const now = new Date();
+            const timeElement = document.querySelector('.uptime');
+            if (timeElement) {
+                timeElement.innerHTML = '<i class="fas fa-clock"></i> Último check: ' + 
+                    now.toLocaleTimeString('es-ES', { 
+                        hour: '2-digit', 
+                        minute: '2-digit',
+                        second: '2-digit'
+                    });
+            }
+        }
+        
+        // Actualizar cada 60 segundos
+        setInterval(updateTime, 60000);
+        
+        // Efecto de carga suave
+        document.addEventListener('DOMContentLoaded', function() {
+            const cards = document.querySelectorAll('.card');
+            cards.forEach((card, index) => {
+                card.style.opacity = '0';
+                card.style.transform = 'translateY(20px)';
+                setTimeout(() => {
+                    card.style.transition = 'opacity 0.5s ease, transform 0.5s ease';
+                    card.style.opacity = '1';
+                    card.style.transform = 'translateY(0)';
+                }, index * 100);
+            });
+            
+            // Efecto de ping para el estado
+            const statusBadge = document.querySelector('.status-badge');
+            if (statusBadge) {
+                setInterval(() => {
+                    statusBadge.style.transform = 'scale(1.05)';
+                    setTimeout(() => {
+                        statusBadge.style.transform = 'scale(1)';
+                    }, 300);
+                }, 3000);
+            }
+        });
+    </script>
+</body>
+</html>
+    `;
+
+    res.status(200).send(html);
 });
 
 app.get('/debug/storage', async (req, res) => {
@@ -1340,21 +1775,6 @@ app.get('/sync/scheduled', (req, res) => {
         status: 'ok',
         message: 'Service is healthy',
         timestamp: new Date().toISOString()
-    });
-});
-
-// Endpoint raíz para health checks
-app.get('/', (req, res) => {
-    res.json({
-        service: 'Drive to GCS Sync',
-        status: 'running',
-        timestamp: new Date().toISOString(),
-        endpoints: {
-            health: '/',
-            manual_sync: 'POST /sync',
-            webhook: 'POST /sync/webhook',
-            scheduled: '/sync/scheduled'
-        }
     });
 });
 
