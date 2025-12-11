@@ -17,7 +17,7 @@ const PORT = process.env.PORT || 8080;
 const WEBHOOK_URL = process.env.WEBHOOK_URL;
 const SYNC_TOPIC = process.env.SYNC_TOPIC || "drive-sync-topic";
 
-const logyser = require('./foto_evidencias/evidencias.controller')
+const logyserSync = require('./foto_evidencias/evidencias.controller')
 
 const LOCAL_CREDENTIALS_PATH = './gcs-key.json';
 
@@ -1784,12 +1784,10 @@ app.get('/sync/scheduled', (req, res) => {
  * Inicia el polling periódico para LogySer Sync
  */
 function startLogySerPolling() {
-    const LOGYSER_POLLING_INTERVAL = 300000; // 5 minutos (300,000 ms)
-    const INITIAL_DELAY = 10000; // 10 segundos después del inicio
+    const LOGYSER_POLLING_INTERVAL = 300000; // 5 minutos
 
     console.log(`\n🔄 Configurando polling automático de LogySer`);
     console.log(`   ⏰ Intervalo: ${LOGYSER_POLLING_INTERVAL / 1000} segundos`);
-    console.log(`   ⏳ Iniciando en: ${INITIAL_DELAY / 1000} segundos`);
 
     async function executeLogySerCycle() {
         console.log('\n🔔 ========================================');
@@ -1799,41 +1797,36 @@ function startLogySerPolling() {
 
         try {
             // Verificar que LogySer esté inicializado
-            if (!logyser.storage) {
+            if (!logyserSync.storage) {
                 console.log('🔧 Inicializando LogySer...');
-                await logyser.initialize();
+                await logyserSync.initialize();
             }
 
-            // Ejecutar sincronización completa
+            // Ejecutar sincronización
             console.log('🔄 Ejecutando sincronización...');
-            const results = await logyser.syncAll();
+            const results = await logyserSync.syncAll();
 
-            console.log('\n📊 RESULTADO DEL CICLO:');
-            console.log(`   ✅ Archivos exitosos: ${results.total.success || 0}`);
-            console.log(`   ❌ Archivos fallidos: ${results.total.failed || 0}`);
-            console.log(`   📁 Carpetas procesadas: ${Object.keys(results.folders || {}).length}`);
-
-            // Guardar estadísticas si quieres
-            console.log(`📅 Hora de finalización: ${new Date().toLocaleString()}`);
-            console.log(`⏰ Próximo ciclo en: ${LOGYSER_POLLING_INTERVAL / 1000} segundos`);
+            // Manejo seguro de resultados
+            if (results && results.success !== false) {
+                if (results.total) {
+                    console.log(`📊 Resultado: ${results.total.success || 0} exitosos, ${results.total.failed || 0} fallidos`);
+                } else if (results.success !== undefined) {
+                    console.log(`📊 Resultado: ${results.success || 0} exitosos, ${results.failed || 0} fallidos`);
+                }
+            } else {
+                console.log('📊 Sincronización completada (sin estadísticas)');
+            }
 
         } catch (error) {
             console.error('❌ Error en ciclo LogySer:', error.message);
-
-            // Intentar reinicializar en el próximo ciclo si hay error crítico
-            if (error.message.includes('no inicializado') ||
-                error.message.includes('autenticación')) {
-                console.log('🔄 Reinicializando LogySer para el próximo ciclo...');
-                logyser.storage = null;
-            }
         } finally {
             // Programar próximo ciclo
             setTimeout(executeLogySerCycle, LOGYSER_POLLING_INTERVAL);
         }
     }
 
-    // Iniciar después del delay inicial
-    setTimeout(executeLogySerCycle, INITIAL_DELAY);
+    // Iniciar después de 30 segundos
+    setTimeout(executeLogySerCycle, 30000);
 }
 
 // ============ EJECUCIÓN AUTOMÁTICA DE LOGYSER ============
@@ -1845,14 +1838,28 @@ function startLogySerPolling() {
         // Dar un pequeño delay para que el servidor se inicialice primero
         setTimeout(async () => {
             console.log('🔧 Inicializando LogySer Sync...');
-            await logyser.initialize();
+            await logyserSync.initialize();
 
             console.log('🔄 Ejecutando primera sincronización...');
-            const results = await logyser.syncAll();
+            const results = await logyserSync.syncAll();
 
             console.log('🎉 LogySer Sync completado inicialmente:');
-            console.log(`   ✅ Archivos exitosos: ${results.total.success}`);
-            console.log(`   ❌ Archivos fallidos: ${results.total.failed}`);
+            if (results && results.total) {
+                console.log(`   ✅ Archivos exitosos: ${results.total.success || 0}`);
+                console.log(`   ❌ Archivos fallidos: ${results.total.failed || 0}`);
+                console.log(`   📁 Carpetas procesadas: ${results.total.folders || 0}`);
+            } else if (results && results.success !== undefined) {
+                console.log(`   ✅ Archivos exitosos: ${results.success || 0}`);
+                console.log(`   ❌ Archivos fallidos: ${results.failed || 0}`);
+            } else if (results && results.totalSuccess !== undefined) {
+                console.log(`   ✅ Archivos exitosos: ${results.totalSuccess || 0}`);
+                console.log(`   ❌ Archivos fallidos: ${results.totalFailed || 0}`);
+            } else {
+                console.log('   ⚠️  No se obtuvieron resultados detallados');
+                if (results) {
+                    console.log(`   🔍 Formato recibido: ${JSON.stringify(results).substring(0, 100)}...`);
+                }
+            }
 
             // Iniciar polling periódico para LogySer
             startLogySerPolling();
