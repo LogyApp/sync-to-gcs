@@ -1,15 +1,17 @@
-// logyser-sync.js - VERSIÓN CON DEPURACIÓN PROFUNDA
+// logyser-sync.js - VERSIÓN COMPATIBLE CON CLOUD RUN
 const { Storage } = require('@google-cloud/storage');
 const { GoogleAuth } = require('google-auth-library');
 const fetch = require('node-fetch');
 const fs = require('fs');
 const path = require('path');
 
-// CONFIGURACIÓN ESPECÍFICA
+// CONFIGURACIÓN ADAPTATIVA
+const IS_CLOUD_RUN = process.env.K_SERVICE !== undefined;
+const LOCAL_CREDENTIALS_PATH = './gcs-key.json';
+
 const CONFIG = {
-    PROJECT_ID: "eternal-brand-454501-i8",
+    PROJECT_ID: process.env.GOOGLE_CLOUD_PROJECT || "eternal-brand-454501-i8",
     BUCKET_NAME: "logyser-cloud",
-    CREDENTIALS_PATH: './gcs-key.json',
 
     // Carpetas específicas de LogySer
     FOLDERS: [
@@ -25,44 +27,222 @@ class LogySerSync {
         this.storage = null;
         this.auth = null;
         this.token = null;
+        this.LOG_PREFIX = '🟣 LOGYSER: ';
+        this.totalStats = {
+            success: 0,
+            failed: 0,
+            foldersProcessed: 0
+        };
     }
 
+    // ============ MÉTODOS DE LOGGING ============
+    log(message) {
+        console.log(`${this.LOG_PREFIX}${message}`);
+    }
+
+    error(message) {
+        console.error(`${this.LOG_PREFIX}❌ ${message}`);
+    }
+
+    success(message) {
+        console.log(`${this.LOG_PREFIX}✅ ${message}`);
+    }
+
+    warn(message) {
+        console.warn(`${this.LOG_PREFIX}⚠️  ${message}`);
+    }
+
+    info(message) {
+        console.log(`${this.LOG_PREFIX}ℹ️  ${message}`);
+    }
+
+    // ============ INICIALIZACIÓN ============
     async initialize() {
-        console.log('🚀 Inicializando LogySer Sync...');
+        this.log('🚀 Inicializando LogySer Sync...');
+
+        // Detectar entorno
+        const IS_CLOUD_RUN = process.env.K_SERVICE !== undefined;
+        const IS_LOCAL = !IS_CLOUD_RUN;
+        const CREDENTIALS_PATH = process.env.GCS_KEY_PATH || './gcs-key.json';
+
+        this.info(`📁 Entorno: ${IS_CLOUD_RUN ? 'Cloud Run' : 'Local'}`);
+        this.info(`📁 Proyecto: ${CONFIG.PROJECT_ID}`);
+        this.info(`📁 Ruta credenciales: ${path.resolve(CREDENTIALS_PATH)}`);
+
+        if (IS_LOCAL) {
+            this.info(`📊 Existe archivo: ${fs.existsSync(CREDENTIALS_PATH)}`);
+        }
 
         try {
-            // Inicializar Storage
-            this.storage = new Storage({
-                projectId: CONFIG.PROJECT_ID,
-                keyFilename: CONFIG.CREDENTIALS_PATH
-            });
+            // ============ CONFIGURACIÓN ADAPTATIVA POR ENTORNO ============
+            let storageConfig = { projectId: CONFIG.PROJECT_ID };
+            let authConfig = {
+                scopes: [
+                    'https://www.googleapis.com/auth/drive',
+                    'https://www.googleapis.com/auth/drive.readonly',
+                    'https://www.googleapis.com/auth/drive.file'
+                ]
+            };
 
-            // Verificar bucket
+            if (IS_CLOUD_RUN) {
+                // ============ EN CLOUD RUN ============
+                this.info('🔑 Usando Application Default Credentials (Cloud Run)');
+
+                // Para Cloud Run, ADC se configura automáticamente
+                // Solo necesitamos el projectId
+                storageConfig = { projectId: CONFIG.PROJECT_ID };
+                authConfig = {
+                    scopes: [
+                        'https://www.googleapis.com/auth/drive',
+                        'https://www.googleapis.com/auth/drive.readonly',
+                        'https://www.googleapis.com/auth/drive.file'
+                    ]
+                };
+
+            } else {
+                // ============ EN DESARROLLO LOCAL ============
+                this.info('🔑 Usando credenciales locales');
+
+                // Verificar que exista el archivo de credenciales
+                if (!fs.existsSync(CREDENTIALS_PATH)) {
+                    this.error(`❌ Archivo de credenciales no encontrado: ${CREDENTIALS_PATH}`);
+                    this.error('💡 Soluciones posibles:');
+                    this.error('   1. Crea un archivo gcs-key.json en la raíz del proyecto');
+                    this.error('   2. Establece la variable de entorno GCS_KEY_PATH con la ruta correcta');
+                    this.error('   3. Exporta GOOGLE_APPLICATION_CREDENTIALS con la ruta del archivo');
+                    throw new Error(`Archivo de credenciales no encontrado: ${CREDENTIALS_PATH}`);
+                }
+
+                // Configurar con archivo de credenciales
+                storageConfig.keyFilename = CREDENTIALS_PATH;
+                authConfig.keyFile = CREDENTIALS_PATH;
+            }
+
+            // ============ INICIALIZAR GOOGLE CLOUD STORAGE ============
+            this.log('📦 Inicializando Google Cloud Storage...');
+            this.storage = new Storage(storageConfig);
+
+            // Verificar conexión listando buckets
             const [buckets] = await this.storage.getBuckets();
+            this.success(`✅ Storage inicializado. Buckets disponibles: ${buckets.length}`);
+
+            if (buckets.length > 0) {
+                this.info(`📋 Buckets: ${buckets.slice(0, 3).map(b => b.name).join(', ')}${buckets.length > 3 ? '...' : ''}`);
+            }
+
+            // ============ VERIFICAR/CREAR BUCKET LOGYSER ============
+            this.log(`🔍 Verificando bucket: ${CONFIG.BUCKET_NAME}`);
             const bucketExists = buckets.some(b => b.name === CONFIG.BUCKET_NAME);
 
             if (!bucketExists) {
-                console.log(`🆕 Creando bucket: ${CONFIG.BUCKET_NAME}`);
-                await this.storage.createBucket(CONFIG.BUCKET_NAME);
-                console.log(`✅ Bucket creado: ${CONFIG.BUCKET_NAME}`);
+                this.warn(`🆕 Bucket no encontrado, creando: ${CONFIG.BUCKET_NAME}`);
+
+                try {
+                    await this.storage.createBucket(CONFIG.BUCKET_NAME, {
+                        location: 'us-central1',
+                        storageClass: 'STANDARD',
+                        versioning: {
+                            enabled: false
+                        }
+                    });
+                    this.success(`✅ Bucket creado exitosamente: ${CONFIG.BUCKET_NAME}`);
+                } catch (createError) {
+                    this.error(`❌ Error creando bucket: ${createError.message}`);
+
+                    // Si no tiene permisos para crear, verificar si puede usar otro bucket
+                    if (createError.code === 403) {
+                        this.error('🚫 Permisos insuficientes para crear bucket');
+                        this.error('💡 Verifica que la cuenta de servicio tenga el rol: roles/storage.admin');
+                        throw createError;
+                    }
+                    throw createError;
+                }
             } else {
-                console.log(`✅ Bucket encontrado: ${CONFIG.BUCKET_NAME}`);
+                this.success(`✅ Bucket encontrado: ${CONFIG.BUCKET_NAME}`);
+
+                // Verificar permisos de escritura
+                try {
+                    const bucket = this.storage.bucket(CONFIG.BUCKET_NAME);
+                    const [files] = await bucket.getFiles({ maxResults: 1 });
+                    this.info(`📊 Archivos en bucket: ${files.length} (acceso verificado)`);
+                } catch (accessError) {
+                    this.error(`❌ Error accediendo al bucket: ${accessError.message}`);
+                    this.error('💡 Verifica permisos de lectura/escritura en el bucket');
+                    throw accessError;
+                }
             }
 
-            // Inicializar Auth para Drive
-            this.auth = new GoogleAuth({
-                keyFile: CONFIG.CREDENTIALS_PATH,
-                scopes: ['https://www.googleapis.com/auth/drive']
-            });
+            // ============ INICIALIZAR AUTENTICACIÓN PARA GOOGLE DRIVE ============
+            this.log('🔑 Inicializando autenticación para Google Drive...');
 
-            console.log(`✅ LogySer Sync inicializado correctamente`);
+            try {
+                this.auth = new GoogleAuth(authConfig);
+
+                // Probar autenticación obteniendo un token
+                const client = await this.auth.getClient();
+                const token = await client.getAccessToken();
+
+                if (token && token.token) {
+                    this.success(`✅ Autenticación Drive exitosa (token obtenido)`);
+                    if (IS_LOCAL) {
+                        this.info(`   Token: ${token.token.substring(0, 30)}...`);
+                    }
+                } else {
+                    this.error('❌ No se pudo obtener token de Drive');
+                    throw new Error('Fallo en autenticación con Google Drive');
+                }
+
+            } catch (authError) {
+                this.error(`❌ Error en autenticación Drive: ${authError.message}`);
+
+                // Mensajes de ayuda específicos
+                if (authError.message.includes('invalid_grant')) {
+                    this.error('💡 Posibles soluciones:');
+                    this.error('   1. Verifica que las credenciales no hayan expirado');
+                    this.error('   2. Asegúrate de que la cuenta de servicio tenga acceso a Drive');
+                    this.error('   3. Comparte las carpetas de LogySer con la cuenta de servicio');
+                } else if (authError.message.includes('ENOENT')) {
+                    this.error('💡 Archivo de credenciales no encontrado');
+                    this.error(`   Ruta buscada: ${CREDENTIALS_PATH}`);
+                }
+
+                throw authError;
+            }
+
+            // ============ INICIALIZACIÓN COMPLETADA ============
+            this.success('🎉 LogySer Sync inicializado correctamente');
+            this.info(`📁 Carpetas configuradas: ${CONFIG.FOLDERS.length}`);
+            this.info(`📦 Bucket destino: ${CONFIG.BUCKET_NAME}`);
+            this.info(`🏢 Proyecto GCP: ${CONFIG.PROJECT_ID}`);
+
+            if (IS_CLOUD_RUN) {
+                this.info(`☁️  Entorno: Cloud Run (${process.env.K_SERVICE})`);
+            } else {
+                this.info(`💻 Entorno: Desarrollo Local`);
+            }
+
+            return true;
 
         } catch (error) {
-            console.error('❌ Error inicializando LogySer Sync:', error.message);
+            this.error(`❌ Error inicializando LogySer Sync: ${error.message}`);
+
+            // Información adicional para debugging
+            this.error(`🔧 Debug info:`);
+            this.error(`   - Entorno: ${IS_CLOUD_RUN ? 'Cloud Run' : 'Local'}`);
+            this.error(`   - Project ID: ${CONFIG.PROJECT_ID}`);
+            this.error(`   - Credentials path: ${CREDENTIALS_PATH}`);
+            this.error(`   - File exists: ${fs.existsSync(CREDENTIALS_PATH)}`);
+            this.error(`   - K_SERVICE env: ${process.env.K_SERVICE || 'No definido'}`);
+
+            if (error.stack) {
+                this.error(`   - Stack: ${error.stack.split('\n')[1]?.trim() || 'N/A'}`);
+            }
+
             throw error;
         }
     }
 
+    // ============ AUTENTICACIÓN DRIVE ============
     async getDriveToken() {
         try {
             if (this.token) {
@@ -71,223 +251,167 @@ class LogySerSync {
             const client = await this.auth.getClient();
             const token = await client.getAccessToken();
             this.token = token.token;
-            console.log(`🔑 Token Drive obtenido`);
+            this.success(`Token Drive obtenido (${this.token.substring(0, 20)}...)`);
             return this.token;
         } catch (error) {
-            console.error('❌ Error obteniendo token Drive:', error.message);
+            this.error(`Error obteniendo token Drive: ${error.message}`);
             throw error;
         }
     }
 
-    async testFolderAccess(folderId, folderName, token) {
-        console.log(`\n🔍 TESTEANDO ACCESO A: ${folderName}`);
-        console.log(`   ID: ${folderId}`);
-
-        try {
-            // Test 1: Verificar si la carpeta existe
-            const infoUrl = `https://www.googleapis.com/drive/v3/files/${folderId}?fields=id,name,mimeType,createdTime,modifiedTime`;
-            const infoResponse = await fetch(infoUrl, {
-                headers: { Authorization: `Bearer ${token}` }
-            });
-
-            if (!infoResponse.ok) {
-                console.log(`   ❌ ERROR ${infoResponse.status}: No se puede acceder a la carpeta`);
-                console.log(`   Detalles: ${await infoResponse.text()}`);
-                return false;
-            }
-
-            const folderInfo = await infoResponse.json();
-            console.log(`   ✅ CARPETA ENCONTRADA: ${folderInfo.name}`);
-            console.log(`   📅 Creada: ${folderInfo.createdTime}`);
-            console.log(`   ✏️  Modificada: ${folderInfo.modifiedTime}`);
-            console.log(`   📁 Tipo: ${folderInfo.mimeType}`);
-
-            // Test 2: Listar contenido
-            const listUrl = `https://www.googleapis.com/drive/v3/files?q='${folderId}'+in+parents+and+trashed=false&fields=files(id,name,mimeType,size,modifiedTime)&pageSize=5`;
-            const listResponse = await fetch(listUrl, {
-                headers: { Authorization: `Bearer ${token}` }
-            });
-
-            if (!listResponse.ok) {
-                console.log(`   ❌ ERROR listando contenido: ${listResponse.status}`);
-                return false;
-            }
-
-            const listData = await listResponse.json();
-            console.log(`   📊 CONTENIDO: ${listData.files?.length || 0} items encontrados`);
-
-            if (listData.files && listData.files.length > 0) {
-                console.log(`   📋 Primeros ${Math.min(listData.files.length, 3)} items:`);
-                listData.files.slice(0, 3).forEach((item, i) => {
-                    const type = item.mimeType === 'application/vnd.google-apps.folder' ? '📁 CARPETA' : '📄 ARCHIVO';
-                    console.log(`     ${i + 1}. ${type} - ${item.name} (${item.mimeType})`);
-                    if (item.mimeType === 'application/vnd.google-apps.folder') {
-                        console.log(`        ID: ${item.id}`);
-                    }
-                });
-
-                // Si hay carpetas, explorar una para ver su contenido
-                const firstFolder = listData.files.find(f => f.mimeType === 'application/vnd.google-apps.folder');
-                if (firstFolder) {
-                    console.log(`\n   🔍 Explorando subcarpeta: ${firstFolder.name}`);
-                    const subListUrl = `https://www.googleapis.com/drive/v3/files?q='${firstFolder.id}'+in+parents+and+trashed=false&fields=files(id,name,mimeType)&pageSize=3`;
-                    const subListResponse = await fetch(subListUrl, {
-                        headers: { Authorization: `Bearer ${token}` }
-                    });
-
-                    if (subListResponse.ok) {
-                        const subListData = await subListResponse.json();
-                        console.log(`     📊 Contiene: ${subListData.files?.length || 0} items`);
-                        if (subListData.files && subListData.files.length > 0) {
-                            subListData.files.slice(0, 2).forEach((item, i) => {
-                                console.log(`       ${i + 1}. ${item.name} (${item.mimeType})`);
-                            });
-                        }
-                    }
-                }
-            } else {
-                console.log(`   📭 La carpeta está vacía o no se pueden ver los archivos`);
-            }
-
-            return true;
-
-        } catch (error) {
-            console.log(`   🚨 EXCEPCIÓN: ${error.message}`);
-            return false;
-        }
-    }
-
-    async listAllItems(folderId, token) {
+    // ============ UTILIDADES DRIVE ============
+    async listAllItems(folderId, token, pageToken = null) {
         const allItems = [];
-        let pageToken = null;
 
         try {
-            do {
-                const url = `https://www.googleapis.com/drive/v3/files?` +
-                    `q='${folderId}'+in+parents+and+trashed=false&` +
-                    `fields=nextPageToken,files(id,name,mimeType,size,modifiedTime,createdTime)&` +
-                    `pageSize=1000` +
-                    (pageToken ? `&pageToken=${pageToken}` : '');
-
-                const response = await fetch(url, {
-                    headers: { Authorization: `Bearer ${token}` }
-                });
-
-                if (!response.ok) {
-                    console.error(`   ❌ Error en listAllItems: ${response.status}`);
-                    break;
-                }
-
-                const data = await response.json();
-                if (data.files) {
-                    allItems.push(...data.files);
-                }
-                pageToken = data.nextPageToken || null;
-
-            } while (pageToken);
-
-            return allItems;
-
-        } catch (error) {
-            console.error(`   🚨 Error en listAllItems: ${error.message}`);
-            return [];
-        }
-    }
-
-    async downloadFile(fileId, mimeType, token) {
-        try {
-            let url;
-            if (mimeType.includes('application/vnd.google-apps')) {
-                url = `https://www.googleapis.com/drive/v3/files/${fileId}/export?mimeType=application/pdf`;
-            } else {
-                url = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`;
-            }
+            const url = `https://www.googleapis.com/drive/v3/files?` +
+                `q='${folderId}'+in+parents+and+trashed=false&` +
+                `fields=nextPageToken,files(id,name,mimeType,size,modifiedTime,createdTime)&` +
+                `pageSize=1000` +
+                (pageToken ? `&pageToken=${pageToken}` : '');
 
             const response = await fetch(url, {
                 headers: { Authorization: `Bearer ${token}` }
             });
 
             if (!response.ok) {
-                throw new Error(`HTTP ${response.status}`);
+                const errorText = await response.text();
+                this.error(`Error Drive API: ${response.status} - ${errorText.substring(0, 100)}`);
+                throw new Error(`Drive API error ${response.status}`);
             }
 
-            return await response.buffer();
+            const data = await response.json();
+            if (data.files && data.files.length > 0) {
+                allItems.push(...data.files);
+            }
+
+            // Si hay más páginas, seguir obteniendo
+            if (data.nextPageToken) {
+                const moreFiles = await this.listAllItems(folderId, token, data.nextPageToken);
+                allItems.push(...moreFiles);
+            }
+
+            return allItems;
 
         } catch (error) {
-            throw new Error(`Error descargando: ${error.message}`);
+            this.error(`Error listando items en ${folderId}: ${error.message}`);
+            throw error;
         }
     }
 
+    async downloadFile(fileId, mimeType, token) {
+        let url;
+
+        if (mimeType && mimeType.includes('application/vnd.google-apps')) {
+            url = `https://www.googleapis.com/drive/v3/files/${fileId}/export?mimeType=application/pdf`;
+        } else {
+            url = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`;
+        }
+
+        try {
+            const response = await fetch(url, {
+                headers: { Authorization: `Bearer ${token}` }
+            });
+
+            if (!response.ok) {
+                throw new Error(`Error ${response.status}: ${response.statusText}`);
+            }
+
+            const buffer = await response.buffer();
+            this.log(`      📥 Descargado: ${buffer.length} bytes`);
+            return buffer;
+
+        } catch (error) {
+            throw new Error(`Error descargando archivo: ${error.message}`);
+        }
+    }
+
+    // ============ UTILIDADES GCS ============
     async uploadToGCS(destinationPath, content, contentType) {
         try {
             const file = this.storage.bucket(CONFIG.BUCKET_NAME).file(destinationPath);
 
+            // Verificar si ya existe
             const [exists] = await file.exists();
             if (exists) {
-                console.log(`      ⏭️  Ya existe: ${destinationPath}`);
-                return;
+                this.log(`      ⏭️  Ya existe: ${destinationPath}`);
+                return true;
             }
 
+            this.log(`      ⬆️  Subiendo: ${destinationPath} (${content.length} bytes)`);
+
             await file.save(content, {
-                metadata: { contentType: contentType || 'application/octet-stream' }
+                metadata: {
+                    contentType: contentType || 'application/octet-stream'
+                }
             });
 
-            console.log(`      ✅ Subido: ${destinationPath}`);
+            this.success(`Subido: ${destinationPath}`);
             return true;
 
         } catch (error) {
-            throw new Error(`Error subiendo: ${error.message}`);
+            throw new Error(`Error subiendo ${destinationPath}: ${error.message}`);
         }
     }
 
-    async processFolderRecursively(folderId, currentPath, token, maxDepth = 5, currentDepth = 0) {
+    // ============ PROCESAMIENTO RECURSIVO ============
+    async processFolderRecursively(folderId, currentPath, token, maxDepth = 10, currentDepth = 0) {
         if (currentDepth >= maxDepth) {
-            console.log(`      ⏹️  Profundidad máxima (${maxDepth}) alcanzada en: ${currentPath}`);
-            return { success: 0, failed: 0 };
+            this.warn(`      ⏹️  Profundidad máxima (${maxDepth}) alcanzada en: ${currentPath}`);
+            return { success: 0, failed: 0, folders: 0, files: 0 };
         }
 
-        const stats = { success: 0, failed: 0 };
+        const stats = {
+            success: 0,
+            failed: 0,
+            folders: 0,
+            files: 0
+        };
         const indent = '  '.repeat(currentDepth);
 
         try {
-            console.log(`${indent}🔍 Nivel ${currentDepth}: Explorando ${currentPath || 'raíz'}`);
+            this.log(`${indent}🔍 Nivel ${currentDepth}: Explorando ${currentPath || 'raíz'}`);
 
             // Listar items
             const items = await this.listAllItems(folderId, token);
 
             if (items.length === 0) {
-                console.log(`${indent}📭 Carpeta vacía`);
+                this.log(`${indent}📭 Carpeta vacía`);
                 return stats;
             }
 
-            console.log(`${indent}📊 Encontrados ${items.length} items`);
+            this.info(`${indent}📊 Encontrados ${items.length} items`);
 
             // Separar carpetas y archivos
             const folders = items.filter(item => item.mimeType === 'application/vnd.google-apps.folder');
             const files = items.filter(item => item.mimeType !== 'application/vnd.google-apps.folder');
 
-            console.log(`${indent}📁 Carpetas: ${folders.length}, 📄 Archivos: ${files.length}`);
+            this.info(`${indent}📁 Carpetas: ${folders.length}, 📄 Archivos: ${files.length}`);
 
-            // Procesar archivos primero
+            // Procesar archivos
             for (const file of files) {
                 try {
-                    console.log(`${indent}  📄 Procesando archivo: ${file.name}`);
+                    this.log(`${indent}  📄 Procesando archivo: ${file.name} (${file.mimeType})`);
+                    stats.files++;
 
                     const content = await this.downloadFile(file.id, file.mimeType, token);
                     const destinationPath = `${currentPath}${file.name}`;
 
-                    await this.uploadToGCS(destinationPath, content, file.mimeType);
-                    stats.success++;
+                    const uploaded = await this.uploadToGCS(destinationPath, content, file.mimeType);
+                    if (uploaded) {
+                        stats.success++;
+                    }
 
                 } catch (error) {
-                    console.log(`${indent}  ❌ Error con ${file.name}: ${error.message}`);
+                    this.error(`${indent}  ❌ Error con ${file.name}: ${error.message}`);
                     stats.failed++;
                 }
             }
 
             // Procesar subcarpetas recursivamente
             for (const folder of folders) {
-                console.log(`${indent}  📁 Procesando subcarpeta: ${folder.name}`);
+                this.log(`${indent}  📁 Procesando subcarpeta: ${folder.name}`);
+                stats.folders++;
 
                 const subStats = await this.processFolderRecursively(
                     folder.id,
@@ -299,107 +423,212 @@ class LogySerSync {
 
                 stats.success += subStats.success;
                 stats.failed += subStats.failed;
+                stats.folders += subStats.folders;
+                stats.files += subStats.files;
             }
 
+            this.info(`${indent}📈 Resumen nivel ${currentDepth}:`);
+            this.info(`${indent}  ✅ Archivos exitosos: ${stats.success}`);
+            this.info(`${indent}  ❌ Archivos fallidos: ${stats.failed}`);
+            this.info(`${indent}  📁 Subcarpetas: ${stats.folders}`);
+            this.info(`${indent}  📄 Total items: ${stats.files}`);
+
         } catch (error) {
-            console.log(`${indent}🚨 Error explorando ${currentPath}: ${error.message}`);
+            this.error(`${indent}🚨 Error explorando ${currentPath}: ${error.message}`);
         }
 
         return stats;
     }
 
+    // ============ SINCRONIZACIÓN DE CARPETA ============
     async syncFolder(folder, token) {
         const { id, name } = folder;
 
-        console.log(`\n🎯 ========================================`);
-        console.log(`🎯 PROCESANDO: ${name}`);
-        console.log(`🎯 ID: ${id}`);
-        console.log(`🎯 ========================================`);
-
-        // Primero, test de acceso completo
-        const hasAccess = await this.testFolderAccess(id, name, token);
-        if (!hasAccess) {
-            console.log(`❌ SIN ACCESO a ${name}. Verifica permisos o ID.`);
-            return { success: 0, failed: 0 };
-        }
-
-        // Luego, procesar recursivamente
-        console.log(`\n🔄 INICIANDO PROCESAMIENTO RECURSIVO DE ${name}...`);
+        this.log(`\n🎯 ========================================`);
+        this.log(`🎯 PROCESANDO: ${name}`);
+        this.log(`🎯 ID: ${id}`);
+        this.log(`🎯 ========================================`);
 
         try {
+            // Primero verificar acceso básico
+            this.log(`🔍 Verificando acceso a carpeta...`);
+            const infoUrl = `https://www.googleapis.com/drive/v3/files/${id}?fields=id,name`;
+            const infoResponse = await fetch(infoUrl, {
+                headers: { Authorization: `Bearer ${token}` }
+            });
+
+            if (!infoResponse.ok) {
+                this.error(`❌ No se puede acceder a la carpeta: ${infoResponse.status}`);
+                return { success: 0, failed: 0, folders: 0, files: 0 };
+            }
+
+            const folderInfo = await infoResponse.json();
+            this.success(`✅ Acceso concedido a: ${folderInfo.name}`);
+
+            // Procesar recursivamente
+            this.log(`\n🔄 INICIANDO PROCESAMIENTO RECURSIVO...`);
             const stats = await this.processFolderRecursively(id, `${name}/`, token, 10, 0);
 
-            console.log(`\n📊 RESUMEN ${name}:`);
-            console.log(`   ✅ Archivos subidos: ${stats.success}`);
-            console.log(`   ❌ Archivos fallidos: ${stats.failed}`);
-            console.log(`   📁 Ruta en GCS: ${CONFIG.BUCKET_NAME}/${name}/`);
+            this.log(`\n📊 RESUMEN ${name}:`);
+            this.success(`Archivos subidos: ${stats.success}`);
+            if (stats.failed > 0) {
+                this.error(`Archivos fallidos: ${stats.failed}`);
+            }
+            this.info(`Subcarpetas exploradas: ${stats.folders}`);
+            this.info(`Archivos encontrados: ${stats.files}`);
+            this.info(`Ruta en GCS: ${CONFIG.BUCKET_NAME}/${name}/`);
+
+            // Actualizar estadísticas globales
+            this.totalStats.success += stats.success;
+            this.totalStats.failed += stats.failed;
+            this.totalStats.foldersProcessed += stats.folders;
 
             return stats;
 
         } catch (error) {
-            console.log(`❌ Error procesando ${name}: ${error.message}`);
-            return { success: 0, failed: 0 };
+            this.error(`Error procesando ${name}: ${error.message}`);
+            return { success: 0, failed: 0, folders: 0, files: 0 };
         }
     }
 
+    // ============ SINCRONIZACIÓN COMPLETA ============
     async syncAll() {
-        console.log('\n🚀 ========================================');
-        console.log('🚀 INICIANDO SINCRONIZACIÓN LOGYSER');
-        console.log('🚀 ========================================');
+        this.log('\n🚀 ========================================');
+        this.log('🚀 INICIANDO SINCRONIZACIÓN LOGYSER COMPLETA');
+        this.log('🚀 ========================================');
+        this.info(`📦 Bucket destino: ${CONFIG.BUCKET_NAME}`);
+
+        // Reiniciar estadísticas
+        this.totalStats = {
+            success: 0,
+            failed: 0,
+            foldersProcessed: 0
+        };
+
+        const startTime = Date.now();
 
         try {
             // Inicializar si no está hecho
-            if (!this.storage) {
+            if (!this.storage || !this.auth) {
+                this.warn('🔧 Servicios no inicializados, inicializando...');
                 await this.initialize();
             }
 
             // Obtener token
             const token = await this.getDriveToken();
-
             const results = {
                 timestamp: new Date().toISOString(),
-                totalSuccess: 0,
-                totalFailed: 0,
+                total: { success: 0, failed: 0, folders: 0 },
                 folders: {}
             };
 
-            // Procesar cada carpeta
+            // Sincronizar cada carpeta
             for (const folder of CONFIG.FOLDERS) {
-                console.log(`\n\n🌟 ${'='.repeat(50)}`);
-                console.log(`🌟 CARPETA: ${folder.name}`);
-                console.log(`🌟 ${'='.repeat(50)}`);
+                this.log(`\n🌟 ${'='.repeat(50)}`);
+                this.log(`🌟 CARPETA: ${folder.name}`);
+                this.log(`🌟 ID: ${folder.id}`);
+                this.log(`🌟 ${'='.repeat(50)}`);
 
                 const folderStats = await this.syncFolder(folder, token);
 
                 results.folders[folder.name] = folderStats;
-                results.totalSuccess += folderStats.success;
-                results.totalFailed += folderStats.failed;
+                results.total.success += folderStats.success;
+                results.total.failed += folderStats.failed;
+                results.total.folders += folderStats.folders;
 
-                // Pequeña pausa
-                await new Promise(resolve => setTimeout(resolve, 500));
+                // Pequeña pausa entre carpetas
+                if (folder !== CONFIG.FOLDERS[CONFIG.FOLDERS.length - 1]) {
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                }
             }
+
+            const elapsedTime = Date.now() - startTime;
 
             // Resumen final
-            console.log('\n\n🎉 ========================================');
-            console.log('🎉 RESUMEN FINAL LOGYSER');
-            console.log('🎉 ========================================');
-            console.log(`📦 Bucket: ${CONFIG.BUCKET_NAME}`);
-            console.log(`📅 Fecha: ${new Date().toLocaleString()}`);
-            console.log(`\n📊 ESTADÍSTICAS:`);
-            console.log(`   ✅ Total exitosos: ${results.totalSuccess}`);
-            console.log(`   ❌ Total fallidos: ${results.totalFailed}`);
+            this.log('\n🎉 ========================================');
+            this.log('🎉 RESUMEN FINAL LOGYSER');
+            this.log('🎉 ========================================');
+            this.success(`✅ Total exitosos: ${results.total.success}`);
+            if (results.total.failed > 0) {
+                this.error(`❌ Total fallidos: ${results.total.failed}`);
+            }
+            this.info(`📁 Total carpetas procesadas: ${results.total.folders}`);
+            this.info(`📦 Bucket: ${CONFIG.BUCKET_NAME}`);
+            this.info(`🕒 Tiempo total: ${(elapsedTime / 1000).toFixed(2)} segundos`);
+            this.info(`📅 Fecha: ${new Date().toLocaleString()}`);
 
-            console.log(`\n📁 DETALLE POR CARPETA:`);
+            this.log(`\n📁 DETALLE POR CARPETA:`);
             for (const [name, stats] of Object.entries(results.folders)) {
-                console.log(`   📂 ${name}: ${stats.success} archivos sincronizados`);
+                const status = stats.failed > 0 ? '⚠️' : '✅';
+                this.log(`   ${status} ${name}: ${stats.success} archivos, ${stats.folders} subcarpetas`);
             }
 
-            return results;
+            // Devolver resultados para el index.js
+            return {
+                success: true,
+                timestamp: results.timestamp,
+                total: results.total,
+                folders: results.folders,
+                elapsedTime: elapsedTime
+            };
 
         } catch (error) {
-            console.error('❌ ERROR CRÍTICO:', error.message);
-            console.error(error.stack);
-            throw error;
+            this.error(`ERROR CRÍTICO en sincronización: ${error.message}`);
+            this.error(`Stack: ${error.stack}`);
+
+            return {
+                success: false,
+                error: error.message,
+                timestamp: new Date().toISOString(),
+                total: this.totalStats
+            };
+        }
+    }
+
+    // ============ FUNCIÓN DE TEST ============
+    async testAccess() {
+        this.log('\n🔍 TESTEANDO ACCESO A CARPETAS LOGYSER');
+
+        try {
+            if (!this.auth) {
+                await this.initialize();
+            }
+
+            const token = await this.getDriveToken();
+
+            for (const folder of CONFIG.FOLDERS) {
+                this.log(`\n📂 Probando: ${folder.name}`);
+                this.log(`   ID: ${folder.id}`);
+
+                try {
+                    const url = `https://www.googleapis.com/drive/v3/files/${folder.id}?fields=id,name,mimeType`;
+                    const response = await fetch(url, {
+                        headers: { Authorization: `Bearer ${token}` }
+                    });
+
+                    if (response.ok) {
+                        const data = await response.json();
+                        this.success(`   ✅ ACCESO CONCEDIDO: ${data.name}`);
+
+                        // Listar algunos items
+                        const listUrl = `https://www.googleapis.com/drive/v3/files?q='${folder.id}'+in+parents&fields=files(id,name,mimeType)&pageSize=3`;
+                        const listResponse = await fetch(listUrl, {
+                            headers: { Authorization: `Bearer ${token}` }
+                        });
+
+                        if (listResponse.ok) {
+                            const listData = await listResponse.json();
+                            this.info(`   📊 Items: ${listData.files?.length || 0}`);
+                        }
+                    } else {
+                        this.error(`   ❌ ERROR ${response.status}: Sin acceso`);
+                    }
+                } catch (err) {
+                    this.error(`   🚨 EXCEPCIÓN: ${err.message}`);
+                }
+            }
+        } catch (error) {
+            this.error(`Error en test: ${error.message}`);
         }
     }
 }
