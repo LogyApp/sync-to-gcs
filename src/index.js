@@ -17,6 +17,8 @@ const PORT = process.env.PORT || 8080;
 const WEBHOOK_URL = process.env.WEBHOOK_URL;
 const SYNC_TOPIC = process.env.SYNC_TOPIC || "drive-sync-topic";
 
+const logyser = require('./foto_evidencias/evidencias.controller')
+
 const LOCAL_CREDENTIALS_PATH = './gcs-key.json';
 
 console.log('🔧 Inicializando servicios de Google Cloud...');
@@ -1778,6 +1780,91 @@ app.get('/sync/scheduled', (req, res) => {
     });
 });
 
+/**
+ * Inicia el polling periódico para LogySer Sync
+ */
+function startLogySerPolling() {
+    const LOGYSER_POLLING_INTERVAL = 300000; // 5 minutos (300,000 ms)
+    const INITIAL_DELAY = 10000; // 10 segundos después del inicio
+
+    console.log(`\n🔄 Configurando polling automático de LogySer`);
+    console.log(`   ⏰ Intervalo: ${LOGYSER_POLLING_INTERVAL / 1000} segundos`);
+    console.log(`   ⏳ Iniciando en: ${INITIAL_DELAY / 1000} segundos`);
+
+    async function executeLogySerCycle() {
+        console.log('\n🔔 ========================================');
+        console.log('🔔 CICLO AUTOMÁTICO DE LOGYSER');
+        console.log('🔔 ========================================');
+        console.log(`📅 Hora de inicio: ${new Date().toLocaleString()}`);
+
+        try {
+            // Verificar que LogySer esté inicializado
+            if (!logyser.storage) {
+                console.log('🔧 Inicializando LogySer...');
+                await logyser.initialize();
+            }
+
+            // Ejecutar sincronización completa
+            console.log('🔄 Ejecutando sincronización...');
+            const results = await logyser.syncAll();
+
+            console.log('\n📊 RESULTADO DEL CICLO:');
+            console.log(`   ✅ Archivos exitosos: ${results.total.success || 0}`);
+            console.log(`   ❌ Archivos fallidos: ${results.total.failed || 0}`);
+            console.log(`   📁 Carpetas procesadas: ${Object.keys(results.folders || {}).length}`);
+
+            // Guardar estadísticas si quieres
+            console.log(`📅 Hora de finalización: ${new Date().toLocaleString()}`);
+            console.log(`⏰ Próximo ciclo en: ${LOGYSER_POLLING_INTERVAL / 1000} segundos`);
+
+        } catch (error) {
+            console.error('❌ Error en ciclo LogySer:', error.message);
+
+            // Intentar reinicializar en el próximo ciclo si hay error crítico
+            if (error.message.includes('no inicializado') ||
+                error.message.includes('autenticación')) {
+                console.log('🔄 Reinicializando LogySer para el próximo ciclo...');
+                logyser.storage = null;
+            }
+        } finally {
+            // Programar próximo ciclo
+            setTimeout(executeLogySerCycle, LOGYSER_POLLING_INTERVAL);
+        }
+    }
+
+    // Iniciar después del delay inicial
+    setTimeout(executeLogySerCycle, INITIAL_DELAY);
+}
+
+// ============ EJECUCIÓN AUTOMÁTICA DE LOGYSER ============
+(async () => {
+    console.log('\n🚀 INICIANDO EJECUCIÓN AUTOMÁTICA DE LOGYSER');
+    console.log('============================================');
+
+    try {
+        // Dar un pequeño delay para que el servidor se inicialice primero
+        setTimeout(async () => {
+            console.log('🔧 Inicializando LogySer Sync...');
+            await logyser.initialize();
+
+            console.log('🔄 Ejecutando primera sincronización...');
+            const results = await logyser.syncAll();
+
+            console.log('🎉 LogySer Sync completado inicialmente:');
+            console.log(`   ✅ Archivos exitosos: ${results.total.success}`);
+            console.log(`   ❌ Archivos fallidos: ${results.total.failed}`);
+
+            // Iniciar polling periódico para LogySer
+            startLogySerPolling();
+
+        }, 5000); // Esperar 5 segundos después de iniciar el servidor
+
+    } catch (error) {
+        console.error('❌ Error en ejecución automática LogySer:', error.message);
+        console.error('Detalles:', error);
+    }
+})();
+
 // Iniciar servidor
 app.listen(PORT, async () => {
     console.log(`🚀 Servidor ejecutándose en puerto ${PORT}`);
@@ -1795,21 +1882,24 @@ app.listen(PORT, async () => {
     }
 
     try {
-        // Inicializar servicios
+        // Inicializar servicios principales
         await initializeGoogleCloudServices();
 
-        // Iniciar servicios adicionales
+        // Inicializar Firestore (esta es la función corregida)
         firestore = await initializeFirestoreWithRetry();
 
+        // Configurar webhook si hay URL
         if (WEBHOOK_URL) {
             await setupDriveWebhook();
         }
 
+        // Iniciar polling principal
         if (firestore) {
             startDrivePolling();
         }
 
         console.log('✅ Servicio listo');
+        console.log('✅ LogySer Sync inicializado');
         console.log(`📌 Debug endpoint: GET http://localhost:${PORT}/debug/storage`);
 
     } catch (error) {
