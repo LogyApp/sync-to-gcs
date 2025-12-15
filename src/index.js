@@ -1637,13 +1637,12 @@ async function runPollingCycle() {
     // Variable para detectar si es la primera sincronización
     let isFirstRun = true;
 
-    // Función interna recursiva
     async function executePolling() {
         try {
             console.log('⏰ Ciclo de polling iniciado...');
 
-            const IS_LOCAL = !process.env.K_SERVICE;
-            const HAS_LOCAL_CREDS = require('fs').existsSync(LOCAL_CREDENTIALS_PATH);
+            const IS_LOCAL = !process.env.K_SERVICE && process.env.NODE_ENV !== 'production';
+            const HAS_LOCAL_CREDS = fs.existsSync(LOCAL_CREDENTIALS_PATH);
 
             // Obtener lastSyncTime
             let lastRun;
@@ -1655,14 +1654,7 @@ async function runPollingCycle() {
                 lastRun = '2000-01-01T00:00:00.000Z';
             }
 
-            // DETECTAR SI ES LA PRIMERA EJECUCIÓN DESPUÉS DEL INICIO
-            if (isFirstRun && lastRun === '2000-01-01T00:00:00.000Z') {
-                console.log('🚀 ¡PRIMERA SINCRONIZACIÓN DETECTADA!');
-                console.log('📥 Obteniendo TODOS los archivos desde el inicio...');
-                isFirstRun = false;
-            }
-
-            // AUTENTICACIÓN
+            // AUTENTICACIÓN UNIFICADA
             let auth;
             if (IS_LOCAL && HAS_LOCAL_CREDS) {
                 console.log('🔑 Usando credenciales locales');
@@ -1675,13 +1667,29 @@ async function runPollingCycle() {
                 setTimeout(executePolling, POLLING_INTERVAL);
                 return;
             } else {
+                // ✅ CLOUD RUN: Usar Application Default Credentials
+                console.log('🌐 Cloud Run: Usando Application Default Credentials');
                 auth = new GoogleAuth({
                     scopes: ['https://www.googleapis.com/auth/drive']
                 });
             }
 
-            const client = await auth.getClient();
-            const token = (await client.getAccessToken()).token;
+            let token;
+            try {
+                const client = await auth.getClient();
+                token = (await client.getAccessToken()).token;
+            } catch (authError) {
+                console.error('❌ Error de autenticación:', authError.message);
+
+                // Manejo específico para errores 401
+                if (authError.message.includes('401') || authError.code === 401) {
+                    console.log('🔄 Token expirado, reintentando en 10 segundos...');
+                    setTimeout(executePolling, 10000);
+                    return;
+                }
+
+                throw authError;
+            }
 
             // DECIDIR QUÉ FECHA USAR
             let modifiedSince;
@@ -1721,6 +1729,13 @@ async function runPollingCycle() {
 
         } catch (error) {
             console.error('❌ Error en ciclo de polling:', error.message);
+
+            // Manejo específico para errores 401
+            if (error.status === 401 || error.message.includes('401')) {
+                console.log('🔐 Token expirado, reintentando en 30 segundos...');
+                setTimeout(executePolling, 30000);
+                return;
+            }
         } finally {
             // Programar próximo ciclo
             setTimeout(executePolling, POLLING_INTERVAL);
