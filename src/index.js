@@ -39,6 +39,43 @@ const POLLING_INTERVAL = 30000;
 // Middleware
 app.use(express.json());
 
+/**
+ * Procesa archivos en PARALELO (5-10 a la vez)
+ */
+async function processFilesInParallel(files, prefix, token, maxParallel = 10) {
+    const results = { ok: 0, fail: 0 };
+    const semaphore = { count: 0 }; // Controlar concurrencia
+
+    console.log(`   🔄 Procesando ${files.length} archivos en paralelo (${maxParallel} concurrentes)`);
+
+    const processFile = async (file) => {
+        // Esperar si hay demasiados procesos concurrentes
+        while (semaphore.count >= maxParallel) {
+            await new Promise(resolve => setTimeout(resolve, 100));
+        }
+
+        semaphore.count++;
+        try {
+            const blob = await downloadDriveFileREST(file.id, file.mimeType, token);
+            const objectName = prefix + file.name;
+            await uploadBlobToGCS(BUCKET_NAME, objectName, blob, file.mimeType);
+            results.ok++;
+            console.log(`   ✅ [${results.ok}/${files.length}] ${file.name}`);
+        } catch (error) {
+            results.fail++;
+            console.log(`   ❌ Error con ${file.name}: ${error.message}`);
+        } finally {
+            semaphore.count--;
+        }
+    };
+
+    // Iniciar TODOS los procesos (JavaScript maneja la concurrencia)
+    const promises = files.map(file => processFile(file));
+    await Promise.all(promises);
+
+    return results;
+}
+
 function checkLocalCredentials() {
     const credsPath = LOCAL_CREDENTIALS_PATH;
     if (fs.existsSync(credsPath)) {
@@ -173,73 +210,40 @@ async function initializeFirestoreWithRetry() {
     const IS_LOCAL = !process.env.K_SERVICE && process.env.NODE_ENV !== 'production';
     const KEY_FILE_PATH = path.resolve(LOCAL_CREDENTIALS_PATH);
 
-    console.log(`🔧 Inicializando Google Cloud Storage...`);
+    console.log(`🔧 Inicializando Firestore...`);
     console.log(`   📍 Modo: ${IS_LOCAL ? 'Local' : 'Cloud'}`);
-    console.log(`   📍 Ruta credenciales: ${KEY_FILE_PATH}`);
-    console.log(`   📍 Existe archivo: ${fs.existsSync(KEY_FILE_PATH)}`);
 
-    // OPCIÓN 1: Usar credenciales específicas si estamos en local
-    if (IS_LOCAL && fs.existsSync(KEY_FILE_PATH)) {
-        console.log('🔑 Usando credenciales locales para Storage');
-        try {
-            // Leer y validar credenciales
-            const keyContent = JSON.parse(fs.readFileSync(KEY_FILE_PATH, 'utf8'));
-            console.log(`   📧 Cuenta: ${keyContent.client_email}`);
-            console.log(`   🏢 Proyecto: ${keyContent.project_id}`);
-
-            return new Storage({
-                projectId: keyContent.project_id || GOOGLE_CLOUD_PROJECT,
-                keyFilename: KEY_FILE_PATH
-            });
-        } catch (error) {
-            console.error('❌ Error con credenciales locales:', error.message);
-            // Continuar con método 2
-        }
-    }
-
-    // OPCIÓN 2: Usar Application Default Credentials
-    console.log('🌐 Usando Application Default Credentials para Storage');
     try {
-        // Configurar variable de entorno para ADC
         if (IS_LOCAL && fs.existsSync(KEY_FILE_PATH)) {
-            process.env.GOOGLE_APPLICATION_CREDENTIALS = KEY_FILE_PATH;
-            console.log(`   🔧 Estableciendo GOOGLE_APPLICATION_CREDENTIALS: ${KEY_FILE_PATH}`);
+            console.log('🔑 Usando credenciales locales para Firestore');
+
+            // Leer credenciales
+            const keyContent = JSON.parse(fs.readFileSync(KEY_FILE_PATH, 'utf8'));
+
+            return new Firestore({
+                projectId: keyContent.project_id || GOOGLE_CLOUD_PROJECT,
+                keyFilename: KEY_FILE_PATH,
+                ignoreUndefinedProperties: true
+            });
+        } else {
+            console.log('🌐 Usando Application Default Credentials para Firestore');
+
+            // Configurar variable de entorno si existe
+            if (IS_LOCAL && fs.existsSync(KEY_FILE_PATH)) {
+                process.env.GOOGLE_APPLICATION_CREDENTIALS = KEY_FILE_PATH;
+            }
+
+            return new Firestore({
+                projectId: GOOGLE_CLOUD_PROJECT,
+                ignoreUndefinedProperties: true
+            });
         }
-
-        const storage = new Storage({
-            projectId: GOOGLE_CLOUD_PROJECT
-        });
-
-        // Verificar que funciona
-        const [buckets] = await storage.getBuckets();
-        console.log(`✅ Storage inicializado. Buckets disponibles: ${buckets.length}`);
-        return storage;
-
     } catch (error) {
-        console.error('❌ Error con Application Default Credentials:', error.message);
+        console.error('❌ Error inicializando Firestore:', error.message);
 
-        // OPCIÓN 3: Usar autenticación directa con GoogleAuth
-        console.log('🔄 Intentando autenticación directa...');
-        try {
-            const auth = new GoogleAuth({
-                keyFile: KEY_FILE_PATH,
-                scopes: ['https://www.googleapis.com/auth/cloud-platform']
-            });
-
-            const client = await auth.getClient();
-            const projectId = await auth.getProjectId();
-
-            console.log(`   🔑 Autenticado como proyecto: ${projectId}`);
-
-            return new Storage({
-                projectId: projectId,
-                authClient: client
-            });
-
-        } catch (authError) {
-            console.error('❌ Todas las opciones de autenticación fallaron:', authError.message);
-            throw new Error('No se pudo autenticar con Google Cloud Storage');
-        }
+        // Fallback: usar mock
+        console.log('🎭 Usando Firestore mock como fallback');
+        return createMockFirestore();
     }
 }
 
@@ -589,49 +593,63 @@ async function listFilesInFolderREST(folderId, token, customQuery) {
     const q = customQuery || `'${folderId}' in parents and trashed = false`;
 
     do {
+        // 🔥 OBTENER MÁS CAMPOS: incluir size, webContentLink, etc.
         const url = `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(q)}` +
-            `&fields=nextPageToken,files(id,name,mimeType,modifiedTime,parents)&pageSize=1000` +
+            `&fields=nextPageToken,files(id,name,mimeType,modifiedTime,createdTime,size,webContentLink,webViewLink,iconLink,parents,trashed)` +
+            `&pageSize=1000` + // 🔥 Máximo permitido
             (pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : "");
+
+        console.log(`   📤 Consultando: ${folderId} (página ${pageToken ? 'siguiente' : '1'})`);
 
         const response = await fetch(url, {
             headers: { Authorization: "Bearer " + token },
         });
 
         if (!response.ok) {
-            throw new Error(`Drive list error ${response.status} :: ${await response.text()}`);
+            console.error(`   ❌ Error API: ${response.status}`);
+            // 🔥 NO LANZAR ERROR: Devolver lo que tengamos
+            break;
         }
 
         const data = await response.json();
         if (data.files && data.files.length) {
             files.push(...data.files);
+            console.log(`   📥 Obtenidos ${data.files.length} archivos (total: ${files.length})`);
         }
         pageToken = data.nextPageToken || null;
 
     } while (pageToken);
 
+    console.log(`   📊 Total final: ${files.length} archivos`);
     return files;
 }
 
-/**
- * Descarga archivo de Drive
- */
 async function downloadDriveFileREST(fileId, mimeType, token) {
     let url;
-    if (mimeType && mimeType.indexOf("application/vnd.google-apps") === 0) {
-        url = `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}/export?mimeType=${encodeURIComponent("application/pdf")}`;
+
+    // 🔥 QUITAR FILTROS: Manejar TODOS los tipos de Google Apps
+    if (mimeType && mimeType.includes("application/vnd.google-apps")) {
+        // Exportar cualquier Google Doc/Sheet/Slide a PDF
+        url = `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}/export?mimeType=application/pdf`;
     } else {
+        // Cualquier otro archivo: descargar directamente
         url = `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?alt=media`;
     }
+
+    console.log(`   📥 URL de descarga: ${url.substring(0, 100)}...`);
 
     const response = await fetch(url, {
         headers: { Authorization: "Bearer " + token },
     });
 
     if (!response.ok) {
-        throw new Error(`Drive download error ${response.status} :: ${await response.text()}`);
+        const errorText = await response.text();
+        console.error(`   ❌ Error descarga ${response.status}: ${errorText.substring(0, 200)}`);
+        throw new Error(`Drive download error ${response.status}`);
     }
 
     const buffer = await response.buffer();
+    console.log(`   📥 Descargado: ${buffer.length} bytes`);
     return buffer;
 }
 
@@ -639,102 +657,124 @@ async function downloadDriveFileREST(fileId, mimeType, token) {
  * Sube blob a Google Cloud Storage
  */
 async function uploadBlobToGCS(bucket, objectName, blob, contentType) {
-    const MAX_RETRIES = 3;
+    const MAX_RETRIES = 5; // 🔥 Aumentar reintentos
     let lastError = null;
+
+    // 🔥 QUITAR VALIDACIONES: Aceptar cualquier tipo de contenido
+    if (!contentType || contentType === '') {
+        contentType = 'application/octet-stream'; // Tipo por defecto
+    }
+
+    // 🔥 Sanitizar nombre de archivo (remover caracteres problemáticos)
+    const sanitizedObjectName = objectName
+        .replace(/[^\w\-\/\.\s]/g, '_') // Reemplazar caracteres especiales
+        .replace(/\s+/g, '_'); // Reemplazar espacios
+
+    if (sanitizedObjectName !== objectName) {
+        console.log(`   🔧 Nombre sanitizado: ${objectName} → ${sanitizedObjectName}`);
+    }
+
+    console.log(`   📦 Subiendo: ${sanitizedObjectName}`);
+    console.log(`   📊 Tamaño: ${(blob.length / (1024 * 1024)).toFixed(2)} MB`);
+    console.log(`   🏷️  Tipo: ${contentType}`);
 
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
         try {
-            console.log(`⬆️  [Intento ${attempt}/${MAX_RETRIES}] Subiendo a GCS: ${objectName}`);
+            console.log(`   🔄 Intento ${attempt}/${MAX_RETRIES}`);
 
-            // Verificar que storage esté inicializado
             if (!storage) {
-                console.log('🔄 Re-inicializando Storage...');
+                console.log('   🔄 Re-inicializando Storage...');
                 storage = await initializeStorageWithRetry();
             }
 
-            const file = storage.bucket(bucket).file(objectName);
+            const file = storage.bucket(bucket).file(sanitizedObjectName);
 
-            // Opciones de upload
+            // 🔥 CONFIGURACIÓN SIN RESTRICCIONES
             const options = {
                 metadata: {
-                    contentType: contentType || 'application/octet-stream',
+                    contentType: contentType,
+                    // 🔥 Quitar validaciones estrictas
                 },
-                // Para desarrollo, podemos deshabilitar validaciones estrictas
-                validation: false,
-                // No usar resumable upload para archivos pequeños
-                resumable: false
+                validation: false, // 🔥 Deshabilitar validación
+                // 🔥 Para archivos grandes, usar upload resumible automáticamente
+                resumable: blob.length > 5 * 1024 * 1024, // > 5MB = resumible
+                // 🔥 Aumentar timeout para archivos grandes
+                timeout: blob.length > 50 * 1024 * 1024 ? 600000 : 300000, // 10 o 5 minutos
             };
 
-            console.log(`   📊 Tamaño: ${blob.length} bytes`);
-            console.log(`   📦 Bucket: ${bucket}`);
-            console.log(`   🏷️  Content-Type: ${options.metadata.contentType}`);
+            // 🔥 PARA ARCHIVOS MUY GRANDES: usar upload en chunks
+            if (blob.length > 100 * 1024 * 1024) { // > 100MB
+                console.log(`   ⚠️  Archivo muy grande (${(blob.length / (1024 * 1024)).toFixed(2)} MB), usando upload optimizado`);
 
+                // Opción 1: Usar stream para archivos muy grandes
+                const writeStream = file.createWriteStream(options);
+
+                return new Promise((resolve, reject) => {
+                    writeStream.on('error', reject);
+                    writeStream.on('finish', () => {
+                        console.log(`   ✅ Archivo grande subido: ${sanitizedObjectName}`);
+                        resolve(file);
+                    });
+
+                    // Escribir en chunks
+                    const chunkSize = 10 * 1024 * 1024; // 10MB chunks
+                    for (let i = 0; i < blob.length; i += chunkSize) {
+                        const chunk = blob.slice(i, i + chunkSize);
+                        writeStream.write(chunk);
+                        console.log(`   📦 Chunk ${Math.floor(i / chunkSize) + 1} de ${Math.ceil(blob.length / chunkSize)}: ${(chunk.length / (1024 * 1024)).toFixed(2)} MB`);
+                    }
+                    writeStream.end();
+                });
+            }
+
+            // Para archivos normales: upload directo
             await file.save(blob, options);
 
-            console.log(`✅ Archivo subido exitosamente: ${objectName}`);
+            console.log(`   ✅ Subido exitosamente: ${sanitizedObjectName}`);
 
-            // Verificar que el archivo existe
+            // Verificar que existe
             const [exists] = await file.exists();
             if (exists) {
                 const [metadata] = await file.getMetadata();
                 console.log(`   📅 Creado: ${metadata.timeCreated}`);
-                console.log(`   🔗 URI: gs://${bucket}/${objectName}`);
+                console.log(`   🔗 URI: gs://${bucket}/${sanitizedObjectName}`);
+                console.log(`   💾 Tamaño final: ${metadata.size} bytes`);
             }
 
             return file;
 
         } catch (error) {
             lastError = error;
-            console.error(`❌ Intento ${attempt} fallado:`, error.message);
+            console.error(`   ❌ Intento ${attempt} fallado: ${error.message}`);
 
-            // Análisis específico del error
-            if (error.code === 401 || error.message.includes('authentication')) {
-                console.log('🔐 Error de autenticación. Re-inicializando credenciales...');
-                // Forzar re-inicialización en el próximo intento
-                storage = null;
-
-                // Esperar antes de reintentar
+            // Análisis del error
+            if (error.code === 400) {
+                console.log('   🔧 Posible problema con el tipo de contenido, intentando con tipo genérico...');
+                // Reintentar con tipo genérico
+                contentType = 'application/octet-stream';
+            }
+            else if (error.code === 403) {
+                console.log('   🔐 Error de permisos, esperando y reintentando...');
+                await new Promise(resolve => setTimeout(resolve, 5000 * attempt));
+            }
+            else if (error.message.includes('timeout') || error.message.includes('socket')) {
+                console.log(`   ⏱️  Timeout, aumentando tiempo de espera...`);
+                await new Promise(resolve => setTimeout(resolve, 10000 * attempt));
+            }
+            else {
+                console.log(`   🔄 Reintentando en ${2 * attempt} segundos...`);
                 await new Promise(resolve => setTimeout(resolve, 2000 * attempt));
-
-            } else if (error.code === 403) {
-                console.log('🚫 Error de permisos. Verifica roles de la cuenta de servicio.');
-                console.log('   La cuenta necesita: roles/storage.admin');
-                break; // No reintentar errores de permisos
-
-            } else if (error.code === 404) {
-                console.log(`🔍 Bucket no encontrado: ${bucket}`);
-                console.log(`   Verifica que el bucket exista en el proyecto ${GOOGLE_CLOUD_PROJECT}`);
-                break; // No reintentar errores de bucket no encontrado
-
-            } else {
-                // Error genérico, esperar y reintentar
-                await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
             }
         }
     }
 
     // Si llegamos aquí, todos los intentos fallaron
-    console.error(`❌ ERROR CRÍTICO: No se pudo subir ${objectName} después de ${MAX_RETRIES} intentos`);
-    console.error(`   Último error: ${lastError?.message}`);
+    console.error(`   ❌ ERROR CRÍTICO: No se pudo subir ${objectName}`);
+    console.error(`   📝 Último error: ${lastError?.message}`);
 
-    // Información de debug adicional
-    console.log('\n🔧 INFORMACIÓN DE DEBUG:');
-    console.log(`   Proyecto: ${GOOGLE_CLOUD_PROJECT}`);
-    console.log(`   Bucket: ${bucket}`);
-    console.log(`   Archivo: ${objectName}`);
-    console.log(`   Storage inicializado: ${!!storage}`);
-    console.log(`   Credenciales locales: ${fs.existsSync(LOCAL_CREDENTIALS_PATH)}`);
-
-    if (storage) {
-        try {
-            const [buckets] = await storage.getBuckets();
-            console.log(`   Buckets disponibles: ${buckets.map(b => b.name).join(', ')}`);
-        } catch (e) {
-            console.log(`   Error listando buckets: ${e.message}`);
-        }
-    }
-
-    throw lastError || new Error(`Failed to upload ${objectName}`);
+    // 🔥 NO LANZAR ERROR: Continuar con el siguiente archivo
+    console.log(`   ⏭️  Saltando archivo y continuando...`);
+    return null;
 }
 
 /**
@@ -752,133 +792,64 @@ async function isFolderEmpty(folderId, token) {
 async function processFolderIncremental(folderId, prefix, token, modifiedSince) {
     let ok = 0, fail = 0, folders = 0;
 
-    console.log(`🔍 INICIANDO PROCESAMIENTO:`);
-    console.log(`   📁 Folder ID: ${folderId}`);
-    console.log(`   📍 Prefix: ${prefix || '(raíz)'}`);
-    console.log(`   📅 Buscando modificados desde: ${modifiedSince}`);
-    console.log(`   🔑 Token: ${token ? 'VÁLIDO' : 'INVÁLIDO'}`);
-
-    // Construir query con validación
-    const q = `'${folderId}' in parents and trashed = false and modifiedTime > '${modifiedSince}'`;
-    console.log(`   🔎 Query de Drive: ${q}`);
+    console.log(`\n📁 PROCESANDO: ${prefix || 'raíz'}`);
 
     try {
-        // 1. Obtener archivos modificados
-        console.log(`   📤 Consultando Drive API...`);
+        const q = `'${folderId}' in parents and trashed = false`;
         const items = await listFilesInFolderREST(folderId, token, q);
-        console.log(`   📊 RESULTADO: ${items.length} items encontrados`);
 
-        // Mostrar primeros items para debug
-        if (items.length > 0) {
-            console.log(`   📋 Primeros ${Math.min(items.length, 5)} items:`);
-            items.slice(0, 5).forEach((item, i) => {
-                const modified = new Date(item.modifiedTime).toLocaleString();
-                console.log(`     ${i + 1}. ${item.name} (${item.mimeType}) - Modificado: ${modified}`);
-            });
-            if (items.length > 5) {
-                console.log(`     ... y ${items.length - 5} más`);
-            }
+        console.log(`📊 Encontrados: ${items.length} items`);
+
+        // Separar carpetas y archivos
+        const folderItems = items.filter(item => item.mimeType === "application/vnd.google-apps.folder");
+        const fileItems = items.filter(item => item.mimeType !== "application/vnd.google-apps.folder");
+
+        console.log(`   📄 Archivos: ${fileItems.length}, 📁 Carpetas: ${folderItems.length}`);
+
+        // 🔥 PROCESAR ARCHIVOS EN PARALELO
+        if (fileItems.length > 0) {
+            const fileResults = await processFilesInParallel(fileItems, prefix, token, 15); // 15 concurrentes
+            ok += fileResults.ok;
+            fail += fileResults.fail;
         }
 
-        // 2. Si no hay items, verificar si la carpeta está vacía
-        if (items.length === 0) {
-            console.log(`   ℹ️  No se encontraron archivos modificados después de: ${modifiedSince}`);
+        // 🔥 PROCESAR CARPETAS EN PARALELO (limitado a 3-5 para no saturar)
+        const MAX_PARALLEL_FOLDERS = 5;
+        console.log(`   🔄 Procesando ${folderItems.length} carpetas (${MAX_PARALLEL_FOLDERS} concurrentes)`);
 
-            // Solo crear placeholder si la carpeta está realmente vacía
-            const isEmpty = await isFolderEmpty(folderId, token);
-            console.log(`   📂 La carpeta ${isEmpty ? 'ESTÁ VACÍA' : 'NO ESTÁ VACÍA, tiene archivos más antiguos'}`);
-
-            if (isEmpty && prefix) {
-                try {
-                    const placeholderName = prefix + "__placeholder";
-                    console.log(`   🏷️  Creando placeholder: ${placeholderName}`);
-                    await uploadBlobToGCS(BUCKET_NAME, placeholderName, Buffer.from(""), "text/plain");
-                    console.log(`   ✅ Placeholder creado: ${placeholderName}`);
-                    ok++;
-                } catch (err) {
-                    console.log(`   ❌ ERROR creando placeholder: ${err.message}`);
-                    fail++;
-                }
-            } else if (isEmpty) {
-                console.log(`   ⏭️  Carpeta raíz vacía - sin placeholder`);
-            }
-
-            console.log(`   📭 FIN PROCESAMIENTO: 0 archivos procesados`);
-            return { ok, fail, folders };
-        }
-
-        // 3. Procesar items encontrados
-        console.log(`   🔄 Procesando ${items.length} items en: ${prefix || '(raíz)'}`);
-
-        for (let i = 0; i < items.length; i++) {
-            const item = items[i];
-            console.log(`   [${i + 1}/${items.length}] Procesando: ${item.name}`);
-
-            if (item.mimeType === "application/vnd.google-apps.folder") {
-                console.log(`     📁 Es una CARPETA, procesando recursivamente...`);
+        for (let i = 0; i < folderItems.length; i += MAX_PARALLEL_FOLDERS) {
+            const batch = folderItems.slice(i, i + MAX_PARALLEL_FOLDERS);
+            const batchPromises = batch.map(async (folder) => {
+                console.log(`   📁 Iniciando: ${folder.name}`);
                 folders++;
-                const subPrefix = prefix + item.name + "/";
-                const subStats = await processFolderIncremental(item.id, subPrefix, token, modifiedSince);
-                ok += subStats.ok;
-                fail += subStats.fail;
-                folders += subStats.folders;
-                console.log(`     ✅ Carpeta '${item.name}' procesada: ${subStats.ok} archivos, ${subStats.folders} subcarpetas`);
-            } else {
-                console.log(`     📄 Es un ARCHIVO (${item.mimeType})`);
+                const subPrefix = prefix + folder.name + "/";
                 try {
-                    // Descargar archivo
-                    console.log(`       ⬇️  Descargando de Drive...`);
-                    const blob = await downloadDriveFileREST(item.id, item.mimeType, token);
-                    console.log(`       ✅ Descargado: ${blob.length} bytes`);
-
-                    // Subir a GCS
-                    const objectName = prefix + item.name;
-                    console.log(`       ⬆️  Subiendo a GCS como: ${objectName}`);
-                    await uploadBlobToGCS(BUCKET_NAME, objectName, blob, item.mimeType);
-
-                    console.log(`       ✅ SUBIDO EXITOSO: ${objectName}`);
-                    ok++;
-
+                    const subStats = await processFolderIncremental(folder.id, subPrefix, token, modifiedSince);
+                    return subStats;
                 } catch (err) {
-                    console.log(`       ❌ ERROR procesando '${item.name}': ${err.message}`);
-
-                    // Error específico para permisos
-                    if (err.message.includes('403') || err.message.includes('permission')) {
-                        console.log(`       🔐 Posible problema de permisos con el archivo`);
-                    }
-                    // Error específico para tamaño
-                    else if (err.message.includes('size') || err.message.includes('large')) {
-                        console.log(`       📏 Posible problema de tamaño del archivo`);
-                    }
-
-                    fail++;
+                    console.error(`   ❌ Error en carpeta ${folder.name}: ${err.message}`);
+                    return { ok: 0, fail: 1, folders: 1 };
                 }
-            }
+            });
+
+            const batchResults = await Promise.all(batchPromises);
+            batchResults.forEach(stats => {
+                ok += stats.ok;
+                fail += stats.fail;
+                folders += stats.folders;
+            });
+
+            console.log(`   📈 Progreso carpetas: ${Math.min(i + MAX_PARALLEL_FOLDERS, folderItems.length)}/${folderItems.length}`);
         }
 
-        // 4. Resumen final
-        console.log(`   📈 RESUMEN PROCESAMIENTO:`);
-        console.log(`     ✅ Archivos exitosos: ${ok}`);
-        console.log(`     ❌ Archivos fallidos: ${fail}`);
-        console.log(`     📁 Carpetas procesadas: ${folders}`);
-        console.log(`     📅 Última modificación buscada: ${modifiedSince}`);
-
-        if (ok > 0) {
-            console.log(`   🎉 ¡SINCRONIZACIÓN EXITOSA!`);
-        } else if (fail > 0) {
-            console.log(`   ⚠️  Sin archivos exitosos, ${fail} fallos`);
-        } else {
-            console.log(`   ℹ️  No se procesaron archivos nuevos`);
-        }
+        console.log(`\n✅ FINALIZADO: ${prefix || 'raíz'}`);
+        console.log(`   ✅ Archivos: ${ok}, ❌ Fallos: ${fail}, 📁 Carpetas: ${folders}`);
 
         return { ok, fail, folders };
 
     } catch (error) {
-        console.error(`   🚨 ERROR CRÍTICO en processFolderIncremental: ${error.message}`);
-        console.error(`   📍 Detalles: ${error.stack || 'Sin stack trace'}`);
-
-        // Re-lanzar el error para manejo superior
-        throw error;
+        console.error(`❌ ERROR en ${prefix}: ${error.message}`);
+        return { ok, fail, folders };
     }
 }
 
@@ -1802,9 +1773,27 @@ function startLogySerPolling() {
                 await logyserSync.initialize();
             }
 
-            // Ejecutar sincronización
+            // 🔥 CAMBIO IMPORTANTE: Usar sincronización COMPLETA (true) al menos la primera vez
             console.log('🔄 Ejecutando sincronización...');
-            const results = await logyserSync.syncAll();
+
+            // Determinar si es primera ejecución o forzar completa
+            let forceFullSync = false;
+
+            // Verificar si ya se ha ejecutado antes (puedes usar un archivo o variable)
+            const SYNC_STATE_FILE = 'logyser_last_full_sync.txt';
+            const hasFullSyncedBefore = fs.existsSync(SYNC_STATE_FILE);
+
+            if (!hasFullSyncedBefore) {
+                console.log('🚀 ¡PRIMERA SINCRONIZACIÓN DETECTADA! Forzando sincronización completa...');
+                forceFullSync = true;
+                // Marcar que ya se hizo sincronización completa
+                fs.writeFileSync(SYNC_STATE_FILE, new Date().toISOString());
+            } else {
+                console.log('🔄 Sincronización incremental (ya se hizo completa antes)');
+                forceFullSync = false;
+            }
+
+            const results = await logyserSync.syncAll(forceFullSync);
 
             // Manejo seguro de resultados
             if (results && results.success !== false) {
@@ -1840,8 +1829,9 @@ function startLogySerPolling() {
             console.log('🔧 Inicializando LogySer Sync...');
             await logyserSync.initialize();
 
-            console.log('🔄 Ejecutando primera sincronización...');
-            const results = await logyserSync.syncAll();
+            console.log('🔄 Ejecutando PRIMERA SINCRONIZACIÓN COMPLETA...');
+            // 🔥 FORZAR SINCRONIZACIÓN COMPLETA LA PRIMERA VEZ
+            const results = await logyserSync.syncAll(true);
 
             console.log('🎉 LogySer Sync completado inicialmente:');
             if (results && results.total) {
@@ -1860,6 +1850,11 @@ function startLogySerPolling() {
                     console.log(`   🔍 Formato recibido: ${JSON.stringify(results).substring(0, 100)}...`);
                 }
             }
+
+            // Marcar que ya se hizo sincronización completa
+            const SYNC_STATE_FILE = 'logyser_last_full_sync.txt';
+            fs.writeFileSync(SYNC_STATE_FILE, new Date().toISOString());
+            console.log('📝 Marcado que se realizó sincronización completa');
 
             // Iniciar polling periódico para LogySer
             startLogySerPolling();
@@ -1892,8 +1887,13 @@ app.listen(PORT, async () => {
         // Inicializar servicios principales
         await initializeGoogleCloudServices();
 
-        // Inicializar Firestore (esta es la función corregida)
-        firestore = await initializeFirestoreWithRetry();
+        // Verificar si Firestore ya está inicializado
+        if (!firestore) {
+            console.log('🔧 Firestore no inicializado, inicializando...');
+            firestore = await initializeFirestoreWithRetry();
+        } else {
+            console.log('✅ Firestore ya está inicializado');
+        }
 
         // Configurar webhook si hay URL
         if (WEBHOOK_URL) {

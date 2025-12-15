@@ -354,8 +354,19 @@ class LogySerSync {
         }
     }
 
+    async fileExistsInGCS(filePath) {
+        try {
+            const file = this.storage.bucket(CONFIG.BUCKET_NAME).file(filePath);
+            const [exists] = await file.exists();
+            return exists;
+        } catch (error) {
+            this.warn(`Error verificando existencia de ${filePath}: ${error.message}`);
+            return false;
+        }
+    }
+
     // ============ PROCESAMIENTO RECURSIVO ============
-    async processFolderRecursively(folderId, currentPath, token, maxDepth = 10, currentDepth = 0) {
+    async processFolderRecursively(folderId, currentPath, token, maxDepth = 10, currentDepth = 0, modifiedSince = null) {
         if (currentDepth >= maxDepth) {
             this.warn(`      ⏹️  Profundidad máxima (${maxDepth}) alcanzada en: ${currentPath}`);
             return { success: 0, failed: 0, folders: 0, files: 0 };
@@ -372,23 +383,23 @@ class LogySerSync {
         try {
             this.log(`${indent}🔍 Nivel ${currentDepth}: Explorando ${currentPath || 'raíz'}`);
 
-            // Listar items
-            const items = await this.listAllItems(folderId, token);
+            // Obtener TODOS los archivos (sin filtro)
+            const allItems = await this.listAllItems(folderId, token);
 
-            if (items.length === 0) {
+            if (allItems.length === 0) {
                 this.log(`${indent}📭 Carpeta vacía`);
                 return stats;
             }
 
-            this.info(`${indent}📊 Encontrados ${items.length} items`);
+            this.info(`${indent}📊 Encontrados ${allItems.length} items totales`);
 
             // Separar carpetas y archivos
-            const folders = items.filter(item => item.mimeType === 'application/vnd.google-apps.folder');
-            const files = items.filter(item => item.mimeType !== 'application/vnd.google-apps.folder');
+            const folders = allItems.filter(item => item.mimeType === 'application/vnd.google-apps.folder');
+            const files = allItems.filter(item => item.mimeType !== 'application/vnd.google-apps.folder');
 
             this.info(`${indent}📁 Carpetas: ${folders.length}, 📄 Archivos: ${files.length}`);
 
-            // Procesar archivos
+            // 🔥 PROCESAR TODOS LOS ARCHIVOS (no filtrar por tiempo)
             for (const file of files) {
                 try {
                     this.log(`${indent}  📄 Procesando archivo: ${file.name} (${file.mimeType})`);
@@ -408,7 +419,7 @@ class LogySerSync {
                 }
             }
 
-            // Procesar subcarpetas recursivamente
+            // Procesar TODAS las subcarpetas
             for (const folder of folders) {
                 this.log(`${indent}  📁 Procesando subcarpeta: ${folder.name}`);
                 stats.folders++;
@@ -418,7 +429,8 @@ class LogySerSync {
                     `${currentPath}${folder.name}/`,
                     token,
                     maxDepth,
-                    currentDepth + 1
+                    currentDepth + 1,
+                    modifiedSince
                 );
 
                 stats.success += subStats.success;
@@ -431,7 +443,7 @@ class LogySerSync {
             this.info(`${indent}  ✅ Archivos exitosos: ${stats.success}`);
             this.info(`${indent}  ❌ Archivos fallidos: ${stats.failed}`);
             this.info(`${indent}  📁 Subcarpetas: ${stats.folders}`);
-            this.info(`${indent}  📄 Total items: ${stats.files}`);
+            this.info(`${indent}  📄 Total items procesados: ${stats.files}`);
 
         } catch (error) {
             this.error(`${indent}🚨 Error explorando ${currentPath}: ${error.message}`);
@@ -441,7 +453,7 @@ class LogySerSync {
     }
 
     // ============ SINCRONIZACIÓN DE CARPETA ============
-    async syncFolder(folder, token) {
+    async syncFolder(folder, token, forceFullSync = false) {
         const { id, name } = folder;
 
         this.log(`\n🎯 ========================================`);
@@ -450,24 +462,23 @@ class LogySerSync {
         this.log(`🎯 ========================================`);
 
         try {
-            // Primero verificar acceso básico
-            this.log(`🔍 Verificando acceso a carpeta...`);
-            const infoUrl = `https://www.googleapis.com/drive/v3/files/${id}?fields=id,name`;
-            const infoResponse = await fetch(infoUrl, {
-                headers: { Authorization: `Bearer ${token}` }
-            });
+            // TEMPORAL: Para probar, usar siempre sincronización completa
+            // TODO: Implementar lógica de estado después
+            const modifiedSince = forceFullSync ? '2000-01-01T00:00:00.000Z' : '2000-01-01T00:00:00.000Z';
 
-            if (!infoResponse.ok) {
-                this.error(`❌ No se puede acceder a la carpeta: ${infoResponse.status}`);
-                return { success: 0, failed: 0, folders: 0, files: 0 };
+            if (forceFullSync) {
+                this.log(`🔧 MODO FORZADO: Sincronizando TODO`);
+            } else {
+                this.log(`🔧 Modo normal (sin estado aún)`);
             }
-
-            const folderInfo = await infoResponse.json();
-            this.success(`✅ Acceso concedido a: ${folderInfo.name}`);
 
             // Procesar recursivamente
             this.log(`\n🔄 INICIANDO PROCESAMIENTO RECURSIVO...`);
-            const stats = await this.processFolderRecursively(id, `${name}/`, token, 10, 0);
+            const stats = await this.processFolderRecursively(id, `${name}/`, token, 10, 0, modifiedSince);
+
+            // Guardar estado (por ahora siempre fecha actual)
+            const newSyncTime = new Date().toISOString();
+            await this.saveFolderSyncState(id, newSyncTime);
 
             this.log(`\n📊 RESUMEN ${name}:`);
             this.success(`Archivos subidos: ${stats.success}`);
@@ -476,6 +487,7 @@ class LogySerSync {
             }
             this.info(`Subcarpetas exploradas: ${stats.folders}`);
             this.info(`Archivos encontrados: ${stats.files}`);
+            this.info(`Última sincronización: ${newSyncTime}`);
             this.info(`Ruta en GCS: ${CONFIG.BUCKET_NAME}/${name}/`);
 
             // Actualizar estadísticas globales
@@ -492,11 +504,15 @@ class LogySerSync {
     }
 
     // ============ SINCRONIZACIÓN COMPLETA ============
-    async syncAll() {
+    async syncAll(forceFullSync = false) {
         this.log('\n🚀 ========================================');
-        this.log('🚀 INICIANDO SINCRONIZACIÓN LOGYSER COMPLETA');
+        this.log(`🚀 INICIANDO SINCRONIZACIÓN LOGYSER ${forceFullSync ? 'COMPLETA' : 'INCREMENTAL'}`);
         this.log('🚀 ========================================');
         this.info(`📦 Bucket destino: ${CONFIG.BUCKET_NAME}`);
+
+        if (forceFullSync) {
+            this.warn('🔧 MODO FORZADO: Sincronizando TODOS los archivos (no solo nuevos)');
+        }
 
         // Reiniciar estadísticas
         this.totalStats = {
@@ -518,6 +534,7 @@ class LogySerSync {
             const token = await this.getDriveToken();
             const results = {
                 timestamp: new Date().toISOString(),
+                mode: forceFullSync ? 'full' : 'incremental',
                 total: { success: 0, failed: 0, folders: 0 },
                 folders: {}
             };
@@ -529,7 +546,7 @@ class LogySerSync {
                 this.log(`🌟 ID: ${folder.id}`);
                 this.log(`🌟 ${'='.repeat(50)}`);
 
-                const folderStats = await this.syncFolder(folder, token);
+                const folderStats = await this.syncFolder(folder, token, forceFullSync);
 
                 results.folders[folder.name] = folderStats;
                 results.total.success += folderStats.success;
@@ -556,6 +573,7 @@ class LogySerSync {
             this.info(`📦 Bucket: ${CONFIG.BUCKET_NAME}`);
             this.info(`🕒 Tiempo total: ${(elapsedTime / 1000).toFixed(2)} segundos`);
             this.info(`📅 Fecha: ${new Date().toLocaleString()}`);
+            this.info(`🔧 Modo: ${results.mode}`);
 
             this.log(`\n📁 DETALLE POR CARPETA:`);
             for (const [name, stats] of Object.entries(results.folders)) {
@@ -563,13 +581,13 @@ class LogySerSync {
                 this.log(`   ${status} ${name}: ${stats.success} archivos, ${stats.folders} subcarpetas`);
             }
 
-            // Devolver resultados para el index.js
             return {
                 success: true,
                 timestamp: results.timestamp,
                 total: results.total,
                 folders: results.folders,
-                elapsedTime: elapsedTime
+                elapsedTime: elapsedTime,
+                mode: results.mode
             };
 
         } catch (error) {
