@@ -1,19 +1,17 @@
-// logyser-sync.js - VERSIÓN COMPATIBLE CON CLOUD RUN
+// logyser-sync.js - VERSIÓN COMPLETA OPTIMIZADA
 const { Storage } = require('@google-cloud/storage');
 const { GoogleAuth } = require('google-auth-library');
 const fetch = require('node-fetch');
 const fs = require('fs');
 const path = require('path');
 
-// CONFIGURACIÓN ADAPTATIVA
-const IS_CLOUD_RUN = process.env.K_SERVICE !== undefined;
-const LOCAL_CREDENTIALS_PATH = './gcs-key.json';
-
+// CONFIGURACIÓN
 const CONFIG = {
     PROJECT_ID: process.env.GOOGLE_CLOUD_PROJECT || "eternal-brand-454501-i8",
     BUCKET_NAME: "logyser-cloud",
-
-    // Carpetas específicas de LogySer
+    MAX_PARALLEL_DOWNLOADS: 10,
+    MAX_PARALLEL_UPLOADS: 15,
+    PAGE_SIZE: 1000,
     FOLDERS: [
         { id: '1sWP0riOd96vSF9awPxF52Uu49QarWqAD', name: 'Foto_Consignaciones' },
         { id: '1CQlhcl4lMu3EU5GAYm_KIhV29gQb977H', name: 'Foto_Documentos' },
@@ -27,12 +25,15 @@ class LogySerSync {
         this.storage = null;
         this.auth = null;
         this.token = null;
+        this.tokenExpiry = null;
         this.LOG_PREFIX = '🟣 LOGYSER: ';
         this.totalStats = {
             success: 0,
             failed: 0,
             foldersProcessed: 0
         };
+        this.IS_CLOUD_RUN = process.env.K_SERVICE !== undefined;
+        this.IS_LOCAL = !this.IS_CLOUD_RUN;
     }
 
     // ============ MÉTODOS DE LOGGING ============
@@ -59,202 +60,186 @@ class LogySerSync {
     // ============ INICIALIZACIÓN ============
     async initialize() {
         this.log('🚀 Inicializando LogySer Sync...');
-
-        // Detectar entorno
-        const IS_CLOUD_RUN = process.env.K_SERVICE !== undefined;
-        const IS_LOCAL = !IS_CLOUD_RUN;
-        const CREDENTIALS_PATH = process.env.GCS_KEY_PATH || './gcs-key.json';
-
-        this.info(`📁 Entorno: ${IS_CLOUD_RUN ? 'Cloud Run' : 'Local'}`);
-        this.info(`📁 Proyecto: ${CONFIG.PROJECT_ID}`);
-        this.info(`📁 Ruta credenciales: ${path.resolve(CREDENTIALS_PATH)}`);
-
-        if (IS_LOCAL) {
-            this.info(`📊 Existe archivo: ${fs.existsSync(CREDENTIALS_PATH)}`);
-        }
+        this.info(`🔍 Entorno: ${this.IS_CLOUD_RUN ? 'Cloud Run' : 'Local'}`);
 
         try {
-            // ============ CONFIGURACIÓN ADAPTATIVA POR ENTORNO ============
-            let storageConfig = { projectId: CONFIG.PROJECT_ID };
-            let authConfig = {
-                scopes: [
-                    'https://www.googleapis.com/auth/drive',
-                    'https://www.googleapis.com/auth/drive.readonly',
-                    'https://www.googleapis.com/auth/drive.file'
-                ]
-            };
-
-            if (IS_CLOUD_RUN) {
-                // ============ EN CLOUD RUN ============
-                this.info('🔑 Usando Application Default Credentials (Cloud Run)');
-
-                // Para Cloud Run, ADC se configura automáticamente
-                // Solo necesitamos el projectId
-                storageConfig = { projectId: CONFIG.PROJECT_ID };
-                authConfig = {
-                    scopes: [
-                        'https://www.googleapis.com/auth/drive',
-                        'https://www.googleapis.com/auth/drive.readonly',
-                        'https://www.googleapis.com/auth/drive.file'
-                    ]
-                };
-
+            // 1. INICIALIZAR STORAGE Y AUTH SEGÚN ENTORNO
+            if (this.IS_CLOUD_RUN) {
+                await this.initializeForCloudRun();
             } else {
-                // ============ EN DESARROLLO LOCAL ============
-                this.info('🔑 Usando credenciales locales');
-
-                // Verificar que exista el archivo de credenciales
-                if (!fs.existsSync(CREDENTIALS_PATH)) {
-                    this.error(`❌ Archivo de credenciales no encontrado: ${CREDENTIALS_PATH}`);
-                    this.error('💡 Soluciones posibles:');
-                    this.error('   1. Crea un archivo gcs-key.json en la raíz del proyecto');
-                    this.error('   2. Establece la variable de entorno GCS_KEY_PATH con la ruta correcta');
-                    this.error('   3. Exporta GOOGLE_APPLICATION_CREDENTIALS con la ruta del archivo');
-                    throw new Error(`Archivo de credenciales no encontrado: ${CREDENTIALS_PATH}`);
-                }
-
-                // Configurar con archivo de credenciales
-                storageConfig.keyFilename = CREDENTIALS_PATH;
-                authConfig.keyFile = CREDENTIALS_PATH;
+                await this.initializeForLocal();
             }
 
-            // ============ INICIALIZAR GOOGLE CLOUD STORAGE ============
-            this.log('📦 Inicializando Google Cloud Storage...');
-            this.storage = new Storage(storageConfig);
+            // 2. VERIFICAR BUCKET
+            await this.verifyAndCreateBucket();
 
-            // Verificar conexión listando buckets
-            const [buckets] = await this.storage.getBuckets();
-            this.success(`✅ Storage inicializado. Buckets disponibles: ${buckets.length}`);
+            // 3. VERIFICAR AUTENTICACIÓN DRIVE
+            await this.verifyDriveAuth();
 
-            if (buckets.length > 0) {
-                this.info(`📋 Buckets: ${buckets.slice(0, 3).map(b => b.name).join(', ')}${buckets.length > 3 ? '...' : ''}`);
-            }
-
-            // ============ VERIFICAR/CREAR BUCKET LOGYSER ============
-            this.log(`🔍 Verificando bucket: ${CONFIG.BUCKET_NAME}`);
-            const bucketExists = buckets.some(b => b.name === CONFIG.BUCKET_NAME);
-
-            if (!bucketExists) {
-                this.warn(`🆕 Bucket no encontrado, creando: ${CONFIG.BUCKET_NAME}`);
-
-                try {
-                    await this.storage.createBucket(CONFIG.BUCKET_NAME, {
-                        location: 'us-central1',
-                        storageClass: 'STANDARD',
-                        versioning: {
-                            enabled: false
-                        }
-                    });
-                    this.success(`✅ Bucket creado exitosamente: ${CONFIG.BUCKET_NAME}`);
-                } catch (createError) {
-                    this.error(`❌ Error creando bucket: ${createError.message}`);
-
-                    // Si no tiene permisos para crear, verificar si puede usar otro bucket
-                    if (createError.code === 403) {
-                        this.error('🚫 Permisos insuficientes para crear bucket');
-                        this.error('💡 Verifica que la cuenta de servicio tenga el rol: roles/storage.admin');
-                        throw createError;
-                    }
-                    throw createError;
-                }
-            } else {
-                this.success(`✅ Bucket encontrado: ${CONFIG.BUCKET_NAME}`);
-
-                // Verificar permisos de escritura
-                try {
-                    const bucket = this.storage.bucket(CONFIG.BUCKET_NAME);
-                    const [files] = await bucket.getFiles({ maxResults: 1 });
-                    this.info(`📊 Archivos en bucket: ${files.length} (acceso verificado)`);
-                } catch (accessError) {
-                    this.error(`❌ Error accediendo al bucket: ${accessError.message}`);
-                    this.error('💡 Verifica permisos de lectura/escritura en el bucket');
-                    throw accessError;
-                }
-            }
-
-            // ============ INICIALIZAR AUTENTICACIÓN PARA GOOGLE DRIVE ============
-            this.log('🔑 Inicializando autenticación para Google Drive...');
-
-            try {
-                this.auth = new GoogleAuth(authConfig);
-
-                // Probar autenticación obteniendo un token
-                const client = await this.auth.getClient();
-                const token = await client.getAccessToken();
-
-                if (token && token.token) {
-                    this.success(`✅ Autenticación Drive exitosa (token obtenido)`);
-                    if (IS_LOCAL) {
-                        this.info(`   Token: ${token.token.substring(0, 30)}...`);
-                    }
-                } else {
-                    this.error('❌ No se pudo obtener token de Drive');
-                    throw new Error('Fallo en autenticación con Google Drive');
-                }
-
-            } catch (authError) {
-                this.error(`❌ Error en autenticación Drive: ${authError.message}`);
-
-                // Mensajes de ayuda específicos
-                if (authError.message.includes('invalid_grant')) {
-                    this.error('💡 Posibles soluciones:');
-                    this.error('   1. Verifica que las credenciales no hayan expirado');
-                    this.error('   2. Asegúrate de que la cuenta de servicio tenga acceso a Drive');
-                    this.error('   3. Comparte las carpetas de LogySer con la cuenta de servicio');
-                } else if (authError.message.includes('ENOENT')) {
-                    this.error('💡 Archivo de credenciales no encontrado');
-                    this.error(`   Ruta buscada: ${CREDENTIALS_PATH}`);
-                }
-
-                throw authError;
-            }
-
-            // ============ INICIALIZACIÓN COMPLETADA ============
             this.success('🎉 LogySer Sync inicializado correctamente');
-            this.info(`📁 Carpetas configuradas: ${CONFIG.FOLDERS.length}`);
-            this.info(`📦 Bucket destino: ${CONFIG.BUCKET_NAME}`);
-            this.info(`🏢 Proyecto GCP: ${CONFIG.PROJECT_ID}`);
-
-            if (IS_CLOUD_RUN) {
-                this.info(`☁️  Entorno: Cloud Run (${process.env.K_SERVICE})`);
-            } else {
-                this.info(`💻 Entorno: Desarrollo Local`);
-            }
-
             return true;
 
         } catch (error) {
-            this.error(`❌ Error inicializando LogySer Sync: ${error.message}`);
-
-            // Información adicional para debugging
-            this.error(`🔧 Debug info:`);
-            this.error(`   - Entorno: ${IS_CLOUD_RUN ? 'Cloud Run' : 'Local'}`);
-            this.error(`   - Project ID: ${CONFIG.PROJECT_ID}`);
-            this.error(`   - Credentials path: ${CREDENTIALS_PATH}`);
-            this.error(`   - File exists: ${fs.existsSync(CREDENTIALS_PATH)}`);
-            this.error(`   - K_SERVICE env: ${process.env.K_SERVICE || 'No definido'}`);
-
-            if (error.stack) {
-                this.error(`   - Stack: ${error.stack.split('\n')[1]?.trim() || 'N/A'}`);
-            }
-
+            this.error(`❌ Error inicializando: ${error.message}`);
             throw error;
         }
     }
 
-    // ============ AUTENTICACIÓN DRIVE ============
+    async initializeForCloudRun() {
+        this.info('☁️  Configurando para Cloud Run (ADC)');
+
+        // Storage sin keyFilename en Cloud Run
+        this.storage = new Storage({
+            projectId: CONFIG.PROJECT_ID
+        });
+
+        // Auth sin keyFile en Cloud Run
+        this.auth = new GoogleAuth({
+            scopes: ['https://www.googleapis.com/auth/drive.readonly'],
+            projectId: CONFIG.PROJECT_ID
+        });
+
+        // Verificar ADC
+        try {
+            const credentials = await this.auth.getCredentials();
+            this.success(`✅ ADC activo: ${credentials.client_email}`);
+        } catch (adcError) {
+            this.error(`❌ Error ADC: ${adcError.message}`);
+            throw adcError;
+        }
+    }
+
+    async initializeForLocal() {
+        this.info('💻 Configurando para desarrollo local');
+        const CREDENTIALS_PATH = './gcs-key.json';
+
+        // Verificar archivo de credenciales
+        if (!fs.existsSync(CREDENTIALS_PATH)) {
+            throw new Error(`Archivo gcs-key.json no encontrado en: ${path.resolve(CREDENTIALS_PATH)}`);
+        }
+
+        // Storage con keyFilename en local
+        this.storage = new Storage({
+            projectId: CONFIG.PROJECT_ID,
+            keyFilename: CREDENTIALS_PATH
+        });
+
+        // Auth con keyFile en local
+        this.auth = new GoogleAuth({
+            keyFile: CREDENTIALS_PATH,
+            scopes: ['https://www.googleapis.com/auth/drive.readonly']
+        });
+
+        // Verificar credenciales locales
+        try {
+            const keyContent = JSON.parse(fs.readFileSync(CREDENTIALS_PATH, 'utf8'));
+            this.success(`✅ Credenciales locales: ${keyContent.client_email}`);
+        } catch (parseError) {
+            throw new Error(`Error leyendo gcs-key.json: ${parseError.message}`);
+        }
+    }
+
+    async verifyAndCreateBucket() {
+        try {
+            const [buckets] = await this.storage.getBuckets();
+            const bucketExists = buckets.some(b => b.name === CONFIG.BUCKET_NAME);
+
+            if (bucketExists) {
+                this.success(`✅ Bucket encontrado: ${CONFIG.BUCKET_NAME}`);
+
+                // Verificar acceso
+                const [files] = await this.storage.bucket(CONFIG.BUCKET_NAME).getFiles({ maxResults: 1 });
+                this.info(`📊 Archivos en bucket: ${files.length}`);
+            } else {
+                this.warn(`⚠️  Creando bucket: ${CONFIG.BUCKET_NAME}`);
+                await this.storage.createBucket(CONFIG.BUCKET_NAME, {
+                    location: 'us-central1',
+                    storageClass: 'STANDARD'
+                });
+                this.success(`✅ Bucket creado: ${CONFIG.BUCKET_NAME}`);
+            }
+        } catch (error) {
+            this.error(`⚠️  Error con bucket: ${error.message}`);
+            // Continuar de todas formas
+        }
+    }
+
+    async verifyDriveAuth() {
+        try {
+            if (!this.auth) {
+                throw new Error('Auth no inicializado');
+            }
+
+            const client = await this.auth.getClient();
+            const tokenResponse = await client.getAccessToken();
+
+            if (tokenResponse?.token) {
+                this.token = tokenResponse.token;
+                this.tokenExpiry = Date.now() + (55 * 60 * 1000); // 55 minutos
+                this.success('✅ Autenticación Drive verificada');
+            } else {
+                this.warn('⚠️  No se pudo obtener token inicial');
+            }
+        } catch (error) {
+            this.error(`⚠️  Error verificando auth Drive: ${error.message}`);
+            // No lanzar error, se manejará en getDriveToken()
+        }
+    }
+
+    // ============ MANEJO DE TOKEN CON REINTENTOS ============
     async getDriveToken() {
         try {
-            if (this.token) {
+            // Si el token es válido y no ha expirado, usarlo
+            if (this.token && this.tokenExpiry && Date.now() < this.tokenExpiry) {
                 return this.token;
             }
+
+            this.log('🔄 Obteniendo token de Drive...');
+
+            // Verificar que auth esté inicializado
+            if (!this.auth) {
+                await this.initialize();
+            }
+
             const client = await this.auth.getClient();
-            const token = await client.getAccessToken();
-            this.token = token.token;
-            this.success(`Token Drive obtenido (${this.token.substring(0, 20)}...)`);
+            const tokenResponse = await client.getAccessToken();
+
+            if (!tokenResponse?.token) {
+                throw new Error('No se pudo obtener token de acceso');
+            }
+
+            // Guardar token con tiempo de expiración
+            this.token = tokenResponse.token;
+            this.tokenExpiry = Date.now() + (55 * 60 * 1000); // 55 minutos
+
+            this.success('✅ Token Drive obtenido');
             return this.token;
+
         } catch (error) {
-            this.error(`Error obteniendo token Drive: ${error.message}`);
+            this.error(`❌ Error obteniendo token: ${error.message}`);
+
+            // Manejo específico del error 401
+            if (error.message.includes('401') || error.message.includes('invalid_grant')) {
+
+                if (this.IS_CLOUD_RUN) {
+                    this.error('🔐 ERROR 401 EN CLOUD RUN:');
+                    this.error('💡 Verificar:');
+                    this.error('   1. Service Account tiene rol "roles/drive.reader"');
+                    this.error('   2. Carpetas compartidas con la Service Account');
+                    this.error('   3. Reiniciar servicio después de cambios');
+                } else {
+                    this.error('🔐 ERROR 401 EN LOCAL:');
+                    this.error('💡 Verificar:');
+                    this.error('   1. Archivo gcs-key.json válido');
+                    this.error('   2. Credenciales no han expirado');
+                    this.error('   3. Carpetas compartidas con la cuenta de servicio');
+                }
+
+                // Limpiar token inválido
+                this.token = null;
+                this.tokenExpiry = null;
+            }
+
             throw error;
         }
     }
@@ -267,7 +252,7 @@ class LogySerSync {
             const url = `https://www.googleapis.com/drive/v3/files?` +
                 `q='${folderId}'+in+parents+and+trashed=false&` +
                 `fields=nextPageToken,files(id,name,mimeType,size,modifiedTime,createdTime)&` +
-                `pageSize=1000` +
+                `pageSize=${CONFIG.PAGE_SIZE}` +
                 (pageToken ? `&pageToken=${pageToken}` : '');
 
             const response = await fetch(url, {
@@ -276,8 +261,13 @@ class LogySerSync {
 
             if (!response.ok) {
                 const errorText = await response.text();
-                this.error(`Error Drive API: ${response.status} - ${errorText.substring(0, 100)}`);
-                throw new Error(`Drive API error ${response.status}`);
+
+                // Manejo específico del error 401
+                if (response.status === 401) {
+                    throw new Error(`Token expirado (401): ${errorText.substring(0, 200)}`);
+                }
+
+                throw new Error(`Drive API error ${response.status}: ${errorText.substring(0, 200)}`);
             }
 
             const data = await response.json();
@@ -318,7 +308,6 @@ class LogySerSync {
             }
 
             const buffer = await response.buffer();
-            this.log(`      📥 Descargado: ${buffer.length} bytes`);
             return buffer;
 
         } catch (error) {
@@ -326,7 +315,48 @@ class LogySerSync {
         }
     }
 
-    // ============ UTILIDADES GCS ============
+    // ============ PROCESAMIENTO MASIVO PARALELO ============
+    async processFilesInParallel(files, token, basePath) {
+        const results = { success: 0, failed: 0 };
+        const semaphore = { count: 0 };
+
+        this.info(`📥 Procesando ${files.length} archivos en paralelo (${CONFIG.MAX_PARALLEL_DOWNLOADS} concurrentes)`);
+
+        const processSingleFile = async (file) => {
+            // Control de concurrencia
+            while (semaphore.count >= CONFIG.MAX_PARALLEL_DOWNLOADS) {
+                await new Promise(resolve => setTimeout(resolve, 100));
+            }
+
+            semaphore.count++;
+
+            try {
+                // 1. Descargar archivo
+                const content = await this.downloadFile(file.id, file.mimeType, token);
+
+                // 2. Subir a GCS
+                const destinationPath = `${basePath}${file.name}`;
+                await this.uploadToGCS(destinationPath, content, file.mimeType);
+
+                results.success++;
+                this.log(`   ✅ ${file.name} (${(content.length / 1024 / 1024).toFixed(2)} MB)`);
+
+            } catch (error) {
+                results.failed++;
+                this.error(`   ❌ ${file.name}: ${error.message}`);
+
+            } finally {
+                semaphore.count--;
+            }
+        };
+
+        // Ejecutar todos los procesos en paralelo
+        const promises = files.map(file => processSingleFile(file));
+        await Promise.all(promises);
+
+        return results;
+    }
+
     async uploadToGCS(destinationPath, content, contentType) {
         try {
             const file = this.storage.bucket(CONFIG.BUCKET_NAME).file(destinationPath);
@@ -334,11 +364,8 @@ class LogySerSync {
             // Verificar si ya existe
             const [exists] = await file.exists();
             if (exists) {
-                this.log(`      ⏭️  Ya existe: ${destinationPath}`);
-                return true;
+                return true; // Ya existe, no subir de nuevo
             }
-
-            this.log(`      ⬆️  Subiendo: ${destinationPath} (${content.length} bytes)`);
 
             await file.save(content, {
                 metadata: {
@@ -346,7 +373,6 @@ class LogySerSync {
                 }
             });
 
-            this.success(`Subido: ${destinationPath}`);
             return true;
 
         } catch (error) {
@@ -354,303 +380,246 @@ class LogySerSync {
         }
     }
 
-    async fileExistsInGCS(filePath) {
-        try {
-            const file = this.storage.bucket(CONFIG.BUCKET_NAME).file(filePath);
-            const [exists] = await file.exists();
-            return exists;
-        } catch (error) {
-            this.warn(`Error verificando existencia de ${filePath}: ${error.message}`);
-            return false;
-        }
-    }
-
-    // ============ PROCESAMIENTO RECURSIVO ============
-    async processFolderRecursively(folderId, currentPath, token, maxDepth = 10, currentDepth = 0, modifiedSince = null) {
+    // ============ PROCESAMIENTO RECURSIVO OPTIMIZADO ============
+    async processFolderRecursively(folderId, currentPath, token, maxDepth = 10, currentDepth = 0) {
         if (currentDepth >= maxDepth) {
-            this.warn(`      ⏹️  Profundidad máxima (${maxDepth}) alcanzada en: ${currentPath}`);
+            this.warn(`⏹️  Profundidad máxima alcanzada: ${currentPath}`);
             return { success: 0, failed: 0, folders: 0, files: 0 };
         }
 
-        const stats = {
-            success: 0,
-            failed: 0,
-            folders: 0,
-            files: 0
-        };
-        const indent = '  '.repeat(currentDepth);
+        const stats = { success: 0, failed: 0, folders: 0, files: 0 };
 
         try {
-            this.log(`${indent}🔍 Nivel ${currentDepth}: Explorando ${currentPath || 'raíz'}`);
+            this.log(`📂 Explorando: ${currentPath || 'raíz'}`);
 
-            // Obtener TODOS los archivos (sin filtro)
+            // Listar todos los items
             const allItems = await this.listAllItems(folderId, token);
 
             if (allItems.length === 0) {
-                this.log(`${indent}📭 Carpeta vacía`);
+                this.log('📭 Carpeta vacía');
                 return stats;
             }
-
-            this.info(`${indent}📊 Encontrados ${allItems.length} items totales`);
 
             // Separar carpetas y archivos
             const folders = allItems.filter(item => item.mimeType === 'application/vnd.google-apps.folder');
             const files = allItems.filter(item => item.mimeType !== 'application/vnd.google-apps.folder');
 
-            this.info(`${indent}📁 Carpetas: ${folders.length}, 📄 Archivos: ${files.length}`);
+            this.info(`📊 Encontrados: ${files.length} archivos, ${folders.length} carpetas`);
 
-            // 🔥 PROCESAR TODOS LOS ARCHIVOS (no filtrar por tiempo)
-            for (const file of files) {
-                try {
-                    this.log(`${indent}  📄 Procesando archivo: ${file.name} (${file.mimeType})`);
-                    stats.files++;
+            // 🔥 PROCESAR ARCHIVOS EN PARALELO (MASIVO)
+            if (files.length > 0) {
+                const fileResults = await this.processFilesInParallel(files, token, currentPath);
+                stats.success += fileResults.success;
+                stats.failed += fileResults.failed;
+                stats.files += files.length;
+            }
 
-                    const content = await this.downloadFile(file.id, file.mimeType, token);
-                    const destinationPath = `${currentPath}${file.name}`;
+            // 🔥 PROCESAR SUBCARPETAS EN PARALELO (limitado)
+            if (folders.length > 0) {
+                const MAX_PARALLEL_FOLDERS = 5;
 
-                    const uploaded = await this.uploadToGCS(destinationPath, content, file.mimeType);
-                    if (uploaded) {
-                        stats.success++;
-                    }
+                for (let i = 0; i < folders.length; i += MAX_PARALLEL_FOLDERS) {
+                    const batch = folders.slice(i, i + MAX_PARALLEL_FOLDERS);
 
-                } catch (error) {
-                    this.error(`${indent}  ❌ Error con ${file.name}: ${error.message}`);
-                    stats.failed++;
+                    const batchPromises = batch.map(async (folder) => {
+                        const subStats = await this.processFolderRecursively(
+                            folder.id,
+                            `${currentPath}${folder.name}/`,
+                            token,
+                            maxDepth,
+                            currentDepth + 1
+                        );
+                        return subStats;
+                    });
+
+                    const batchResults = await Promise.all(batchPromises);
+
+                    batchResults.forEach(subStats => {
+                        stats.success += subStats.success;
+                        stats.failed += subStats.failed;
+                        stats.folders += subStats.folders + 1; // +1 por la carpeta actual
+                        stats.files += subStats.files;
+                    });
+
+                    this.info(`   📈 Carpetas procesadas: ${Math.min(i + MAX_PARALLEL_FOLDERS, folders.length)}/${folders.length}`);
                 }
             }
 
-            // Procesar TODAS las subcarpetas
-            for (const folder of folders) {
-                this.log(`${indent}  📁 Procesando subcarpeta: ${folder.name}`);
-                stats.folders++;
-
-                const subStats = await this.processFolderRecursively(
-                    folder.id,
-                    `${currentPath}${folder.name}/`,
-                    token,
-                    maxDepth,
-                    currentDepth + 1,
-                    modifiedSince
-                );
-
-                stats.success += subStats.success;
-                stats.failed += subStats.failed;
-                stats.folders += subStats.folders;
-                stats.files += subStats.files;
-            }
-
-            this.info(`${indent}📈 Resumen nivel ${currentDepth}:`);
-            this.info(`${indent}  ✅ Archivos exitosos: ${stats.success}`);
-            this.info(`${indent}  ❌ Archivos fallidos: ${stats.failed}`);
-            this.info(`${indent}  📁 Subcarpetas: ${stats.folders}`);
-            this.info(`${indent}  📄 Total items procesados: ${stats.files}`);
-
         } catch (error) {
-            this.error(`${indent}🚨 Error explorando ${currentPath}: ${error.message}`);
+            this.error(`❌ Error en ${currentPath}: ${error.message}`);
+            stats.failed += files.length; // Contar todos los archivos como fallidos
         }
 
         return stats;
     }
 
-    // ============ SINCRONIZACIÓN DE CARPETA ============
-    async syncFolder(folder, token, forceFullSync = false) {
-        const { id, name } = folder;
-
-        this.log(`\n🎯 ========================================`);
-        this.log(`🎯 PROCESANDO: ${name}`);
-        this.log(`🎯 ID: ${id}`);
-        this.log(`🎯 ========================================`);
-
-        try {
-            // TEMPORAL: Para probar, usar siempre sincronización completa
-            // TODO: Implementar lógica de estado después
-            const modifiedSince = forceFullSync ? '2000-01-01T00:00:00.000Z' : '2000-01-01T00:00:00.000Z';
-
-            if (forceFullSync) {
-                this.log(`🔧 MODO FORZADO: Sincronizando TODO`);
-            } else {
-                this.log(`🔧 Modo normal (sin estado aún)`);
-            }
-
-            // Procesar recursivamente
-            this.log(`\n🔄 INICIANDO PROCESAMIENTO RECURSIVO...`);
-            const stats = await this.processFolderRecursively(id, `${name}/`, token, 10, 0, modifiedSince);
-
-            // Guardar estado (por ahora siempre fecha actual)
-            const newSyncTime = new Date().toISOString();
-            await this.saveFolderSyncState(id, newSyncTime);
-
-            this.log(`\n📊 RESUMEN ${name}:`);
-            this.success(`Archivos subidos: ${stats.success}`);
-            if (stats.failed > 0) {
-                this.error(`Archivos fallidos: ${stats.failed}`);
-            }
-            this.info(`Subcarpetas exploradas: ${stats.folders}`);
-            this.info(`Archivos encontrados: ${stats.files}`);
-            this.info(`Última sincronización: ${newSyncTime}`);
-            this.info(`Ruta en GCS: ${CONFIG.BUCKET_NAME}/${name}/`);
-
-            // Actualizar estadísticas globales
-            this.totalStats.success += stats.success;
-            this.totalStats.failed += stats.failed;
-            this.totalStats.foldersProcessed += stats.folders;
-
-            return stats;
-
-        } catch (error) {
-            this.error(`Error procesando ${name}: ${error.message}`);
-            return { success: 0, failed: 0, folders: 0, files: 0 };
-        }
-    }
-
     // ============ SINCRONIZACIÓN COMPLETA ============
     async syncAll(forceFullSync = false) {
         this.log('\n🚀 ========================================');
-        this.log(`🚀 INICIANDO SINCRONIZACIÓN LOGYSER ${forceFullSync ? 'COMPLETA' : 'INCREMENTAL'}`);
+        this.log('🚀 INICIANDO SINCRONIZACIÓN MASIVA LOGYSER');
+        this.log(`🚀 Entorno: ${this.IS_CLOUD_RUN ? 'Cloud Run' : 'Local'}`);
+        this.log(`🚀 Paralelismo: ${CONFIG.MAX_PARALLEL_DOWNLOADS} descargas concurrentes`);
         this.log('🚀 ========================================');
-        this.info(`📦 Bucket destino: ${CONFIG.BUCKET_NAME}`);
-
-        if (forceFullSync) {
-            this.warn('🔧 MODO FORZADO: Sincronizando TODOS los archivos (no solo nuevos)');
-        }
 
         // Reiniciar estadísticas
-        this.totalStats = {
-            success: 0,
-            failed: 0,
-            foldersProcessed: 0
-        };
-
+        this.totalStats = { success: 0, failed: 0, foldersProcessed: 0 };
         const startTime = Date.now();
 
         try {
-            // Inicializar si no está hecho
+            // Inicializar si es necesario
             if (!this.storage || !this.auth) {
-                this.warn('🔧 Servicios no inicializados, inicializando...');
                 await this.initialize();
             }
 
-            // Obtener token
-            const token = await this.getDriveToken();
-            const results = {
-                timestamp: new Date().toISOString(),
-                mode: forceFullSync ? 'full' : 'incremental',
-                total: { success: 0, failed: 0, folders: 0 },
-                folders: {}
-            };
+            // Obtener token con manejo de error 401
+            let token;
+            try {
+                token = await this.getDriveToken();
+            } catch (tokenError) {
+                this.error(`❌ No se pudo obtener token: ${tokenError.message}`);
+
+                // Si es error 401, intentar un último reintento
+                if (tokenError.message.includes('401')) {
+                    this.log('🔄 Intentando último reintento en 15 segundos...');
+                    await new Promise(resolve => setTimeout(resolve, 15000));
+                    token = await this.getDriveToken();
+                } else {
+                    throw tokenError;
+                }
+            }
 
             // Sincronizar cada carpeta
             for (const folder of CONFIG.FOLDERS) {
-                this.log(`\n🌟 ${'='.repeat(50)}`);
-                this.log(`🌟 CARPETA: ${folder.name}`);
-                this.log(`🌟 ID: ${folder.id}`);
-                this.log(`🌟 ${'='.repeat(50)}`);
+                this.log(`\n📁 ${'='.repeat(50)}`);
+                this.log(`📁 CARPETA: ${folder.name}`);
+                this.log(`📁 ID: ${folder.id}`);
+                this.log(`📁 ${'='.repeat(50)}`);
 
-                const folderStats = await this.syncFolder(folder, token, forceFullSync);
+                try {
+                    const stats = await this.processFolderRecursively(
+                        folder.id,
+                        `${folder.name}/`,
+                        token
+                    );
 
-                results.folders[folder.name] = folderStats;
-                results.total.success += folderStats.success;
-                results.total.failed += folderStats.failed;
-                results.total.folders += folderStats.folders;
+                    this.totalStats.success += stats.success;
+                    this.totalStats.failed += stats.failed;
+                    this.totalStats.foldersProcessed += stats.folders + 1;
+
+                    this.info(`📊 Resultado ${folder.name}:`);
+                    this.info(`   ✅ Archivos exitosos: ${stats.success}`);
+                    this.info(`   ❌ Archivos fallidos: ${stats.failed}`);
+                    this.info(`   📁 Subcarpetas: ${stats.folders}`);
+                    this.info(`   📄 Total procesado: ${stats.files}`);
+
+                } catch (folderError) {
+                    this.error(`❌ Error crítico en ${folder.name}: ${folderError.message}`);
+                    // Continuar con la siguiente carpeta
+                }
 
                 // Pequeña pausa entre carpetas
                 if (folder !== CONFIG.FOLDERS[CONFIG.FOLDERS.length - 1]) {
-                    await new Promise(resolve => setTimeout(resolve, 1000));
+                    await new Promise(resolve => setTimeout(resolve, 2000));
                 }
             }
 
             const elapsedTime = Date.now() - startTime;
 
-            // Resumen final
+            // RESUMEN FINAL
             this.log('\n🎉 ========================================');
-            this.log('🎉 RESUMEN FINAL LOGYSER');
+            this.log('🎉 RESUMEN FINAL - PROCESAMIENTO MASIVO');
             this.log('🎉 ========================================');
-            this.success(`✅ Total exitosos: ${results.total.success}`);
-            if (results.total.failed > 0) {
-                this.error(`❌ Total fallidos: ${results.total.failed}`);
-            }
-            this.info(`📁 Total carpetas procesadas: ${results.total.folders}`);
-            this.info(`📦 Bucket: ${CONFIG.BUCKET_NAME}`);
-            this.info(`🕒 Tiempo total: ${(elapsedTime / 1000).toFixed(2)} segundos`);
-            this.info(`📅 Fecha: ${new Date().toLocaleString()}`);
-            this.info(`🔧 Modo: ${results.mode}`);
 
-            this.log(`\n📁 DETALLE POR CARPETA:`);
-            for (const [name, stats] of Object.entries(results.folders)) {
-                const status = stats.failed > 0 ? '⚠️' : '✅';
-                this.log(`   ${status} ${name}: ${stats.success} archivos, ${stats.folders} subcarpetas`);
+            if (this.totalStats.success > 0) {
+                this.success(`✅ Archivos exitosos: ${this.totalStats.success}`);
             }
+
+            if (this.totalStats.failed > 0) {
+                this.error(`❌ Archivos fallidos: ${this.totalStats.failed}`);
+            }
+
+            this.info(`📁 Carpetas procesadas: ${this.totalStats.foldersProcessed}`);
+            this.info(`📦 Bucket destino: ${CONFIG.BUCKET_NAME}`);
+            this.info(`⚡ Paralelismo: ${CONFIG.MAX_PARALLEL_DOWNLOADS} descargas concurrentes`);
+            this.info(`🕒 Tiempo total: ${(elapsedTime / 1000).toFixed(2)} segundos`);
+            this.info(`📅 Finalizado: ${new Date().toLocaleString()}`);
 
             return {
                 success: true,
-                timestamp: results.timestamp,
-                total: results.total,
-                folders: results.folders,
+                totalSuccess: this.totalStats.success,
+                totalFailed: this.totalStats.failed,
+                totalFolders: this.totalStats.foldersProcessed,
                 elapsedTime: elapsedTime,
-                mode: results.mode
+                environment: this.IS_CLOUD_RUN ? 'cloud-run' : 'local'
             };
 
         } catch (error) {
-            this.error(`ERROR CRÍTICO en sincronización: ${error.message}`);
-            this.error(`Stack: ${error.stack}`);
+            this.error(`❌ ERROR CRÍTICO en sincronización: ${error.message}`);
 
             return {
                 success: false,
                 error: error.message,
-                timestamp: new Date().toISOString(),
-                total: this.totalStats
+                totalSuccess: this.totalStats.success,
+                totalFailed: this.totalStats.failed,
+                environment: this.IS_CLOUD_RUN ? 'cloud-run' : 'local'
             };
         }
     }
 
-    // ============ FUNCIÓN DE TEST ============
-    async testAccess() {
-        this.log('\n🔍 TESTEANDO ACCESO A CARPETAS LOGYSER');
+    // ============ FUNCIÓN DE DIAGNÓSTICO ============
+    async diagnose() {
+        this.log('\n🔍 ========================================');
+        this.log('🔍 DIAGNÓSTICO LOGYSER SYNC');
+        this.log('🔍 ========================================');
+
+        const results = {
+            environment: this.IS_CLOUD_RUN ? 'Cloud Run' : 'Local',
+            timestamp: new Date().toISOString(),
+            checks: {}
+        };
 
         try {
-            if (!this.auth) {
-                await this.initialize();
-            }
+            // 1. Verificar entorno
+            results.checks.environment = {
+                K_SERVICE: process.env.K_SERVICE || 'No definido',
+                GOOGLE_CLOUD_PROJECT: process.env.GOOGLE_CLOUD_PROJECT || 'No definido',
+                NODE_ENV: process.env.NODE_ENV || 'No definido'
+            };
 
+            // 2. Inicializar
+            await this.initialize();
+            results.checks.initialization = '✅ OK';
+
+            // 3. Verificar token
             const token = await this.getDriveToken();
+            results.checks.token = token ? `✅ Obtenido (${token.length} chars)` : '❌ Falló';
 
-            for (const folder of CONFIG.FOLDERS) {
-                this.log(`\n📂 Probando: ${folder.name}`);
-                this.log(`   ID: ${folder.id}`);
+            // 4. Verificar bucket
+            const [bucketExists] = await this.storage.bucket(CONFIG.BUCKET_NAME).exists();
+            results.checks.bucket = bucketExists ? '✅ Existe' : '❌ No existe';
 
-                try {
-                    const url = `https://www.googleapis.com/drive/v3/files/${folder.id}?fields=id,name,mimeType`;
-                    const response = await fetch(url, {
-                        headers: { Authorization: `Bearer ${token}` }
-                    });
-
-                    if (response.ok) {
-                        const data = await response.json();
-                        this.success(`   ✅ ACCESO CONCEDIDO: ${data.name}`);
-
-                        // Listar algunos items
-                        const listUrl = `https://www.googleapis.com/drive/v3/files?q='${folder.id}'+in+parents&fields=files(id,name,mimeType)&pageSize=3`;
-                        const listResponse = await fetch(listUrl, {
-                            headers: { Authorization: `Bearer ${token}` }
-                        });
-
-                        if (listResponse.ok) {
-                            const listData = await listResponse.json();
-                            this.info(`   📊 Items: ${listData.files?.length || 0}`);
-                        }
-                    } else {
-                        this.error(`   ❌ ERROR ${response.status}: Sin acceso`);
-                    }
-                } catch (err) {
-                    this.error(`   🚨 EXCEPCIÓN: ${err.message}`);
-                }
+            // 5. Verificar acceso a Drive
+            try {
+                const testUrl = 'https://www.googleapis.com/drive/v3/about?fields=user';
+                const response = await fetch(testUrl, {
+                    headers: { Authorization: `Bearer ${token}` }
+                });
+                results.checks.driveAccess = response.ok ? '✅ Acceso concedido' : `❌ Error ${response.status}`;
+            } catch (driveError) {
+                results.checks.driveAccess = `❌ ${driveError.message}`;
             }
+
+            this.success('✅ Diagnóstico completado');
+            return results;
+
         } catch (error) {
-            this.error(`Error en test: ${error.message}`);
+            results.error = error.message;
+            this.error(`❌ Error en diagnóstico: ${error.message}`);
+            return results;
         }
     }
 }
 
-// Exportar una instancia singleton
+// Exportar instancia singleton
 const logyserSync = new LogySerSync();
 module.exports = logyserSync;
