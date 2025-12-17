@@ -1,4 +1,4 @@
-// logyser-sync.js - VERSIÓN COMPLETA OPTIMIZADA
+// logyser-sync.js - VERSIÓN COMPLETA OPTIMIZADA CON SOPORTE PARA COMPUTE ENGINE
 const { Storage } = require('@google-cloud/storage');
 const { GoogleAuth } = require('google-auth-library');
 const fetch = require('node-fetch');
@@ -32,8 +32,86 @@ class LogySerSync {
             failed: 0,
             foldersProcessed: 0
         };
+
+        // 🔥 DETECCIÓN MEJORADA DE ENTORNO
         this.IS_CLOUD_RUN = process.env.K_SERVICE !== undefined;
-        this.IS_LOCAL = !this.IS_CLOUD_RUN;
+        this.IS_COMPUTE_ENGINE = this.detectComputeEngine();
+        this.IS_LOCAL = !this.IS_CLOUD_RUN && !this.IS_COMPUTE_ENGINE;
+
+        // 🔥 PATH DINÁMICO DE CREDENCIALES
+        this.CREDENTIALS_PATH = this.determineCredentialsPath();
+
+        this.log(`🔍 Entorno detectado: ${this.getEnvironmentName()}`);
+    }
+
+    // 🔥 MÉTODO PARA DETECTAR COMPUTE ENGINE
+    detectComputeEngine() {
+        // Variable de entorno específica
+        if (process.env.COMPUTE_ENGINE === 'true') return true;
+
+        // Detección por metadatos de GCE
+        if (process.env.GOOGLE_CLOUD_PROJECT && !process.env.K_SERVICE) {
+            // Verificar si estamos en un sistema Linux (típico de VMs)
+            if (process.platform === 'linux') {
+                // Verificar archivos típicos de Compute Engine
+                if (fs.existsSync('/etc/google-cloud-sdk/')) return true;
+                if (fs.existsSync('/usr/share/google/')) return true;
+
+                // Verificar por nombre de host
+                if (process.env.HOSTNAME && process.env.HOSTNAME.includes('instance-')) return true;
+
+                // Verificar por metadata server (solo en GCE)
+                try {
+                    // Intentar acceder a metadata server
+                    const metadataUrl = 'http://metadata.google.internal/computeMetadata/v1/';
+                    // Solo continuar si parece ser GCE
+                    if (process.env.GCE_METADATA_HOST || process.env.GOOGLE_CLOUD_PROJECT.includes('gcp')) {
+                        return true;
+                    }
+                } catch (e) {
+                    // Ignorar error
+                }
+            }
+        }
+        return false;
+    }
+
+    // 🔥 MÉTODO PARA DETERMINAR PATH DE CREDENCIALES
+    determineCredentialsPath() {
+        // 1. Variable de entorno tiene prioridad
+        if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+            return process.env.GOOGLE_APPLICATION_CREDENTIALS;
+        }
+
+        // 2. Para Compute Engine, buscar en ubicación común
+        if (this.IS_COMPUTE_ENGINE) {
+            const possiblePaths = [
+                '/home/seguimientologyser/sync-to-gcs/gcs-key.json',
+                '/home/seguimientologyser/gcs-key.json',
+                './gcs-key.json',
+                path.join(process.cwd(), 'gcs-key.json')
+            ];
+
+            for (const p of possiblePaths) {
+                if (fs.existsSync(p)) {
+                    this.log(`🔑 Credenciales encontradas en: ${p}`);
+                    return p;
+                }
+            }
+
+            this.warn('⚠️  No se encontró archivo gcs-key.json en Compute Engine');
+            this.info('ℹ️  Se intentará usar Application Default Credentials');
+        }
+
+        // 3. Para local, usar path por defecto
+        return './gcs-key.json';
+    }
+
+    // 🔥 MÉTODO PARA NOMBRE AMIGABLE DEL ENTORNO
+    getEnvironmentName() {
+        if (this.IS_CLOUD_RUN) return 'Cloud Run';
+        if (this.IS_COMPUTE_ENGINE) return 'Compute Engine VM';
+        return 'Local';
     }
 
     // ============ MÉTODOS DE LOGGING ============
@@ -60,12 +138,14 @@ class LogySerSync {
     // ============ INICIALIZACIÓN ============
     async initialize() {
         this.log('🚀 Inicializando LogySer Sync...');
-        this.info(`🔍 Entorno: ${this.IS_CLOUD_RUN ? 'Cloud Run' : 'Local'}`);
+        this.info(`🔍 Entorno: ${this.getEnvironmentName()}`);
 
         try {
             // 1. INICIALIZAR STORAGE Y AUTH SEGÚN ENTORNO
             if (this.IS_CLOUD_RUN) {
                 await this.initializeForCloudRun();
+            } else if (this.IS_COMPUTE_ENGINE) {
+                await this.initializeForComputeEngine();
             } else {
                 await this.initializeForLocal();
             }
@@ -109,31 +189,104 @@ class LogySerSync {
         }
     }
 
+    async initializeForComputeEngine() {
+        this.info('🖥️  Configurando para Compute Engine VM');
+
+        // 🔥 ESTRATEGIA 1: Intentar con archivo de credenciales si existe
+        if (fs.existsSync(this.CREDENTIALS_PATH)) {
+            try {
+                this.info(`🔑 Usando credenciales de archivo: ${this.CREDENTIALS_PATH}`);
+
+                // Leer y validar archivo
+                const keyContent = JSON.parse(fs.readFileSync(this.CREDENTIALS_PATH, 'utf8'));
+
+                // Usar project_id del archivo si está disponible
+                const projectId = keyContent.project_id || CONFIG.PROJECT_ID;
+
+                // Storage con keyFilename
+                this.storage = new Storage({
+                    projectId: projectId,
+                    keyFilename: this.CREDENTIALS_PATH
+                });
+
+                // Auth con keyFile
+                this.auth = new GoogleAuth({
+                    keyFile: this.CREDENTIALS_PATH,
+                    scopes: ['https://www.googleapis.com/auth/drive.readonly']
+                });
+
+                this.success(`✅ Credenciales de archivo: ${keyContent.client_email}`);
+                this.info(`🏢 Proyecto: ${projectId}`);
+                return;
+
+            } catch (fileError) {
+                this.warn(`⚠️  Error con archivo de credenciales: ${fileError.message}`);
+                this.info('🔄 Intentando Application Default Credentials...');
+            }
+        }
+
+        // 🔥 ESTRATEGIA 2: Usar Application Default Credentials
+        this.info('🌐 Usando Application Default Credentials (ADC)');
+
+        // Storage sin keyFilename
+        this.storage = new Storage({
+            projectId: CONFIG.PROJECT_ID
+        });
+
+        // Auth sin keyFile
+        this.auth = new GoogleAuth({
+            scopes: ['https://www.googleapis.com/auth/drive.readonly'],
+            projectId: CONFIG.PROJECT_ID
+        });
+
+        // Intentar verificar ADC
+        try {
+            const credentials = await this.auth.getCredentials();
+            this.success(`✅ ADC activo en VM: ${credentials.client_email}`);
+            this.info(`🏢 Proyecto: ${credentials.project_id}`);
+
+        } catch (adcError) {
+            this.error(`❌ Error ADC en Compute Engine: ${adcError.message}`);
+
+            // Mensaje de ayuda específico para Compute Engine
+            if (adcError.message.includes('403') || adcError.message.includes('PERMISSION_DENIED')) {
+                this.error('🔐 PROBLEMA DE PERMISOS EN COMPUTE ENGINE:');
+                this.error('   La VM necesita permisos para acceder a Drive');
+                this.error('   Soluciones posibles:');
+                this.error('   1. Compartir carpetas de Drive con la Service Account de la VM');
+                this.error('   2. Crear una service account específica y usar archivo gcs-key.json');
+            }
+
+            // No lanzar error, permitir que continúe
+            this.warn('⚠️  Continuando con ADC a pesar del error...');
+        }
+    }
+
     async initializeForLocal() {
         this.info('💻 Configurando para desarrollo local');
-        const CREDENTIALS_PATH = './gcs-key.json';
 
         // Verificar archivo de credenciales
-        if (!fs.existsSync(CREDENTIALS_PATH)) {
-            throw new Error(`Archivo gcs-key.json no encontrado en: ${path.resolve(CREDENTIALS_PATH)}`);
+        if (!fs.existsSync(this.CREDENTIALS_PATH)) {
+            throw new Error(`Archivo gcs-key.json no encontrado en: ${path.resolve(this.CREDENTIALS_PATH)}`);
         }
 
         // Storage con keyFilename en local
         this.storage = new Storage({
             projectId: CONFIG.PROJECT_ID,
-            keyFilename: CREDENTIALS_PATH
+            keyFilename: this.CREDENTIALS_PATH
         });
 
         // Auth con keyFile en local
         this.auth = new GoogleAuth({
-            keyFile: CREDENTIALS_PATH,
+            keyFile: this.CREDENTIALS_PATH,
             scopes: ['https://www.googleapis.com/auth/drive.readonly']
         });
 
         // Verificar credenciales locales
         try {
-            const keyContent = JSON.parse(fs.readFileSync(CREDENTIALS_PATH, 'utf8'));
+            const keyContent = JSON.parse(fs.readFileSync(this.CREDENTIALS_PATH, 'utf8'));
             this.success(`✅ Credenciales locales: ${keyContent.client_email}`);
+            this.info(`🏢 Proyecto: ${keyContent.project_id || CONFIG.PROJECT_ID}`);
         } catch (parseError) {
             throw new Error(`Error leyendo gcs-key.json: ${parseError.message}`);
         }
@@ -218,15 +371,20 @@ class LogySerSync {
         } catch (error) {
             this.error(`❌ Error obteniendo token: ${error.message}`);
 
-            // Manejo específico del error 401
+            // 🔥 MANEJO MEJORADO DE ERRORES POR ENTORNO
             if (error.message.includes('401') || error.message.includes('invalid_grant')) {
-
                 if (this.IS_CLOUD_RUN) {
                     this.error('🔐 ERROR 401 EN CLOUD RUN:');
                     this.error('💡 Verificar:');
                     this.error('   1. Service Account tiene rol "roles/drive.reader"');
                     this.error('   2. Carpetas compartidas con la Service Account');
                     this.error('   3. Reiniciar servicio después de cambios');
+                } else if (this.IS_COMPUTE_ENGINE) {
+                    this.error('🔐 ERROR 401 EN COMPUTE ENGINE:');
+                    this.error('💡 Verificar:');
+                    this.error('   1. Si usas archivo gcs-key.json: que sea válido');
+                    this.error('   2. Si usas ADC: permisos de la VM');
+                    this.error('   3. Carpetas compartidas con la cuenta');
                 } else {
                     this.error('🔐 ERROR 401 EN LOCAL:');
                     this.error('💡 Verificar:');
@@ -238,6 +396,16 @@ class LogySerSync {
                 // Limpiar token inválido
                 this.token = null;
                 this.tokenExpiry = null;
+            }
+
+            // 🔥 MANEJO ESPECÍFICO PARA ERROR 403
+            if (error.message.includes('403') || error.message.includes('PERMISSION_DENIED')) {
+                if (this.IS_COMPUTE_ENGINE) {
+                    this.error('🔐 ERROR 403 EN COMPUTE ENGINE:');
+                    this.error('💡 La Service Account de la VM no tiene permisos de Drive');
+                    this.error('   Solución: Compartir carpetas con la cuenta:');
+                    this.error(`     594761951101-compute@developer.gserviceaccount.com`);
+                }
             }
 
             throw error;
@@ -447,7 +615,7 @@ class LogySerSync {
 
         } catch (error) {
             this.error(`❌ Error en ${currentPath}: ${error.message}`);
-            stats.failed += files.length; // Contar todos los archivos como fallidos
+            stats.failed += files.length; // Contar todos los archivos como fallados
         }
 
         return stats;
@@ -457,7 +625,7 @@ class LogySerSync {
     async syncAll(forceFullSync = false) {
         this.log('\n🚀 ========================================');
         this.log('🚀 INICIANDO SINCRONIZACIÓN MASIVA LOGYSER');
-        this.log(`🚀 Entorno: ${this.IS_CLOUD_RUN ? 'Cloud Run' : 'Local'}`);
+        this.log(`🚀 Entorno: ${this.getEnvironmentName()}`);
         this.log(`🚀 Paralelismo: ${CONFIG.MAX_PARALLEL_DOWNLOADS} descargas concurrentes`);
         this.log('🚀 ========================================');
 
@@ -482,6 +650,12 @@ class LogySerSync {
                 if (tokenError.message.includes('401')) {
                     this.log('🔄 Intentando último reintento en 15 segundos...');
                     await new Promise(resolve => setTimeout(resolve, 15000));
+
+                    // Limpiar auth y reintentar
+                    this.auth = null;
+                    this.token = null;
+                    this.tokenExpiry = null;
+
                     token = await this.getDriveToken();
                 } else {
                     throw tokenError;
@@ -550,7 +724,7 @@ class LogySerSync {
                 totalFailed: this.totalStats.failed,
                 totalFolders: this.totalStats.foldersProcessed,
                 elapsedTime: elapsedTime,
-                environment: this.IS_CLOUD_RUN ? 'cloud-run' : 'local'
+                environment: this.getEnvironmentName().toLowerCase().replace(' ', '-')
             };
 
         } catch (error) {
@@ -561,7 +735,7 @@ class LogySerSync {
                 error: error.message,
                 totalSuccess: this.totalStats.success,
                 totalFailed: this.totalStats.failed,
-                environment: this.IS_CLOUD_RUN ? 'cloud-run' : 'local'
+                environment: this.getEnvironmentName().toLowerCase().replace(' ', '-')
             };
         }
     }
@@ -573,7 +747,7 @@ class LogySerSync {
         this.log('🔍 ========================================');
 
         const results = {
-            environment: this.IS_CLOUD_RUN ? 'Cloud Run' : 'Local',
+            environment: this.getEnvironmentName(),
             timestamp: new Date().toISOString(),
             checks: {}
         };
@@ -583,28 +757,41 @@ class LogySerSync {
             results.checks.environment = {
                 K_SERVICE: process.env.K_SERVICE || 'No definido',
                 GOOGLE_CLOUD_PROJECT: process.env.GOOGLE_CLOUD_PROJECT || 'No definido',
-                NODE_ENV: process.env.NODE_ENV || 'No definido'
+                NODE_ENV: process.env.NODE_ENV || 'No definido',
+                COMPUTE_ENGINE: this.IS_COMPUTE_ENGINE ? 'Sí' : 'No',
+                HOSTNAME: process.env.HOSTNAME || 'No definido'
             };
 
-            // 2. Inicializar
+            // 2. Verificar credenciales
+            results.checks.credentials = {
+                path: this.CREDENTIALS_PATH,
+                exists: fs.existsSync(this.CREDENTIALS_PATH) ? 'Sí' : 'No'
+            };
+
+            // 3. Inicializar
             await this.initialize();
             results.checks.initialization = '✅ OK';
 
-            // 3. Verificar token
+            // 4. Verificar token
             const token = await this.getDriveToken();
             results.checks.token = token ? `✅ Obtenido (${token.length} chars)` : '❌ Falló';
 
-            // 4. Verificar bucket
+            // 5. Verificar bucket
             const [bucketExists] = await this.storage.bucket(CONFIG.BUCKET_NAME).exists();
             results.checks.bucket = bucketExists ? '✅ Existe' : '❌ No existe';
 
-            // 5. Verificar acceso a Drive
+            // 6. Verificar acceso a Drive
             try {
                 const testUrl = 'https://www.googleapis.com/drive/v3/about?fields=user';
                 const response = await fetch(testUrl, {
                     headers: { Authorization: `Bearer ${token}` }
                 });
                 results.checks.driveAccess = response.ok ? '✅ Acceso concedido' : `❌ Error ${response.status}`;
+
+                if (response.ok) {
+                    const data = await response.json();
+                    results.checks.driveUser = data.user || 'No disponible';
+                }
             } catch (driveError) {
                 results.checks.driveAccess = `❌ ${driveError.message}`;
             }

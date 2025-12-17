@@ -9,7 +9,6 @@ const fs = require('fs');
 const app = express();
 const path = require('path');
 
-// Configuración
 const GOOGLE_CLOUD_PROJECT = process.env.GOOGLE_CLOUD_PROJECT || "eternal-brand-454501-i8";
 const BUCKET_NAME = process.env.BUCKET_NAME || "talenthub_central";
 const ROOT_FOLDER_ID = process.env.ROOT_FOLDER_ID || "1PcnN9zwjl9w_b9y99zS6gKWMhwIVdqfD";
@@ -17,12 +16,20 @@ const PORT = process.env.PORT || 8080;
 const WEBHOOK_URL = process.env.WEBHOOK_URL;
 const SYNC_TOPIC = process.env.SYNC_TOPIC || "drive-sync-topic";
 
+const IS_COMPUTE_ENGINE = process.env.COMPUTE_ENGINE === 'true' ||
+    process.env.GOOGLE_CLOUD_PROJECT !== undefined &&
+    !process.env.K_SERVICE;
+const IS_CLOUD_RUN = process.env.K_SERVICE !== undefined;
+const IS_LOCAL = !IS_COMPUTE_ENGINE && !IS_CLOUD_RUN;
+
 const logyserSync = require('./foto_evidencias/evidencias.controller')
 
-const LOCAL_CREDENTIALS_PATH = './gcs-key.json';
+const LOCAL_CREDENTIALS_PATH = IS_COMPUTE_ENGINE
+    ? (process.env.GOOGLE_APPLICATION_CREDENTIALS || '/home/seguimientologyser/sync-to-gcs/gcs-key.json')
+    : './gcs-key.json';
 
 console.log('🔧 Inicializando servicios de Google Cloud...');
-
+console.log(`📍 Entorno detectado: ${IS_COMPUTE_ENGINE ? 'Compute Engine VM' : IS_CLOUD_RUN ? 'Cloud Run' : 'Local'}`);
 
 let storage, firestore, pubsub;
 
@@ -77,23 +84,49 @@ async function processFilesInParallel(files, prefix, token, maxParallel = 10) {
 }
 
 function checkLocalCredentials() {
-    const credsPath = LOCAL_CREDENTIALS_PATH;
-    if (fs.existsSync(credsPath)) {
+    // 🔥 MODIFICAR COMPLETAMENTE ESTA FUNCIÓN
+    console.log('🔍 Verificando credenciales...');
+
+    // Si estamos en Compute Engine y NO hay archivo, usar ADC
+    if (IS_COMPUTE_ENGINE && !fs.existsSync(LOCAL_CREDENTIALS_PATH)) {
+        console.log('✅ Compute Engine: Usando Application Default Credentials');
+        console.log('   La VM usará su service account integrada');
+        return true;
+    }
+
+    // Si hay variable de entorno, usarla
+    if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+        const envPath = process.env.GOOGLE_APPLICATION_CREDENTIALS;
+        if (fs.existsSync(envPath)) {
+            console.log(`✅ Usando credenciales de variable de entorno: ${envPath}`);
+            return true;
+        } else {
+            console.warn(`⚠️  Archivo en GOOGLE_APPLICATION_CREDENTIALS no existe: ${envPath}`);
+        }
+    }
+
+    // Verificar archivo local
+    if (fs.existsSync(LOCAL_CREDENTIALS_PATH)) {
         try {
-            const creds = JSON.parse(fs.readFileSync(credsPath, 'utf8'));
+            const creds = JSON.parse(fs.readFileSync(LOCAL_CREDENTIALS_PATH, 'utf8'));
             console.log('✅ Credenciales locales encontradas');
-            console.log(`   Tipo: ${creds.type || 'N/A'}`);
-            console.log(`   Cliente ID: ${creds.client_id?.substring(0, 20)}...`);
-            console.log(`   Proyecto: ${creds.project_id || 'N/A'}`);
+            console.log(`   📧 Cuenta: ${creds.client_email}`);
+            console.log(`   🏢 Proyecto: ${creds.project_id || 'N/A'}`);
             return true;
         } catch (error) {
             console.error('❌ Error leyendo credenciales:', error.message);
             return false;
         }
     } else {
-        console.log('⚠️  No se encontró gcs-key.json en la raíz del proyecto');
-        console.log('📌 El polling y sincronización manual fallarán en local');
-        return false;
+        if (IS_COMPUTE_ENGINE) {
+            console.log('ℹ️  No se encontró gcs-key.json en Compute Engine');
+            console.log('   Intentando usar Application Default Credentials...');
+            return true; // Permitir continuar con ADC
+        } else {
+            console.log('⚠️  No se encontró gcs-key.json en la raíz del proyecto');
+            console.log('📌 El polling y sincronización manual fallarán en local');
+            return false;
+        }
     }
 }
 
@@ -159,8 +192,14 @@ function createMockFirestore() {
 function startDrivePolling() {
     console.log(`🔄 Configurando polling automático cada ${POLLING_INTERVAL / 1000} segundos...`);
 
-    // Verificar credenciales en local
-    if (!process.env.K_SERVICE) {
+    // 🔥 MODIFICAR ESTA LÓGICA
+    if (IS_CLOUD_RUN) {
+        console.log('☁️  Cloud Run: No se necesitan credenciales locales');
+    } else if (IS_COMPUTE_ENGINE) {
+        console.log('🖥️  Compute Engine: Verificando acceso...');
+        // En Compute Engine, permitir continuar incluso sin archivo
+    } else {
+        // Solo en local verificar estrictamente
         const hasCreds = checkLocalCredentials();
         if (!hasCreds) {
             console.error('❌ No hay credenciales locales, polling no funcionará');
@@ -216,128 +255,144 @@ function startDrivePolling() {
 // }
 
 async function initializeFirestoreWithRetry() {
-    const IS_LOCAL = !process.env.K_SERVICE && process.env.NODE_ENV !== 'production';
-    const KEY_FILE_PATH = path.resolve(LOCAL_CREDENTIALS_PATH);
-
     console.log(`🔧 Inicializando Firestore...`);
-    console.log(`   📍 Modo: ${IS_LOCAL ? 'Local' : 'Cloud'}`);
+    console.log(`   📍 Modo: ${IS_COMPUTE_ENGINE ? 'Compute Engine' : IS_CLOUD_RUN ? 'Cloud Run' : 'Local'}`);
 
     try {
-        if (IS_LOCAL && fs.existsSync(KEY_FILE_PATH)) {
-            console.log('🔑 Usando credenciales locales para Firestore');
+        let firestoreConfig = {
+            projectId: GOOGLE_CLOUD_PROJECT,
+            ignoreUndefinedProperties: true
+        };
 
-            // Leer credenciales
-            const keyContent = JSON.parse(fs.readFileSync(KEY_FILE_PATH, 'utf8'));
+        // Si existe archivo, usarlo
+        if (fs.existsSync(LOCAL_CREDENTIALS_PATH)) {
+            console.log('🔑 Usando credenciales de archivo para Firestore');
+            firestoreConfig.keyFilename = LOCAL_CREDENTIALS_PATH;
 
-            return new Firestore({
-                projectId: keyContent.project_id || GOOGLE_CLOUD_PROJECT,
-                keyFilename: KEY_FILE_PATH,
-                ignoreUndefinedProperties: true
-            });
-        } else {
-            console.log('🌐 Usando Application Default Credentials para Firestore');
-
-            // Configurar variable de entorno si existe
-            if (IS_LOCAL && fs.existsSync(KEY_FILE_PATH)) {
-                process.env.GOOGLE_APPLICATION_CREDENTIALS = KEY_FILE_PATH;
+            // Ajustar projectId si está en el archivo
+            try {
+                const keyContent = JSON.parse(fs.readFileSync(LOCAL_CREDENTIALS_PATH, 'utf8'));
+                if (keyContent.project_id) {
+                    firestoreConfig.projectId = keyContent.project_id;
+                }
+            } catch (e) {
+                // Ignorar error de lectura
             }
-
-            return new Firestore({
-                projectId: GOOGLE_CLOUD_PROJECT,
-                ignoreUndefinedProperties: true
-            });
+        } else if (IS_COMPUTE_ENGINE || IS_CLOUD_RUN) {
+            console.log('🌐 Usando Application Default Credentials para Firestore');
+            // Configuración por defecto ya está lista
+        } else {
+            console.log('💻 Local: Intentando ADC para Firestore');
         }
+
+        const firestoreInstance = new Firestore(firestoreConfig);
+
+        // Probar conexión
+        await firestoreInstance.listCollections();
+        console.log('✅ Firestore inicializado correctamente');
+
+        return firestoreInstance;
+
     } catch (error) {
         console.error('❌ Error inicializando Firestore:', error.message);
 
-        // Fallback: usar mock
+        // Fallback para Compute Engine
+        if (IS_COMPUTE_ENGINE) {
+            console.log('🔄 Intentando Firestore sin configuración específica...');
+            try {
+                const fallbackFirestore = new Firestore({
+                    projectId: GOOGLE_CLOUD_PROJECT,
+                    ignoreUndefinedProperties: true
+                });
+                console.log('✅ Firestore fallback inicializado');
+                return fallbackFirestore;
+            } catch (fallbackError) {
+                console.error('❌ Fallback falló:', fallbackError.message);
+            }
+        }
+
+        // Fallback final: usar mock
         console.log('🎭 Usando Firestore mock como fallback');
         return createMockFirestore();
     }
 }
 
 async function initializeStorageWithRetry() {
-    const IS_LOCAL = !process.env.K_SERVICE && process.env.NODE_ENV !== 'production';
-    const KEY_FILE_PATH = path.resolve(LOCAL_CREDENTIALS_PATH);
-
     console.log(`🔧 Inicializando Google Cloud Storage...`);
-    console.log(`   📍 Modo: ${IS_LOCAL ? 'Local' : 'Cloud'}`);
-    console.log(`   📍 Ruta credenciales: ${KEY_FILE_PATH}`);
-    console.log(`   📍 Existe archivo: ${fs.existsSync(KEY_FILE_PATH)}`);
+    console.log(`   📍 Entorno: ${IS_COMPUTE_ENGINE ? 'Compute Engine' : IS_CLOUD_RUN ? 'Cloud Run' : 'Local'}`);
 
-    // OPCIÓN 1: Usar credenciales específicas si estamos en local
-    if (IS_LOCAL && fs.existsSync(KEY_FILE_PATH)) {
-        console.log('🔑 Usando credenciales locales para Storage');
-        try {
-            // Leer y validar credenciales
-            const keyContent = JSON.parse(fs.readFileSync(KEY_FILE_PATH, 'utf8'));
-            console.log(`   📧 Cuenta: ${keyContent.client_email}`);
-            console.log(`   🏢 Proyecto: ${keyContent.project_id}`);
-
-            return new Storage({
-                projectId: keyContent.project_id || GOOGLE_CLOUD_PROJECT,
-                keyFilename: KEY_FILE_PATH
-            });
-        } catch (error) {
-            console.error('❌ Error con credenciales locales:', error.message);
-            // Continuar con método 2
-        }
-    }
-
-    // OPCIÓN 2: Usar Application Default Credentials
-    console.log('🌐 Usando Application Default Credentials para Storage');
+    // 🔥 SIMPLIFICAR LA LÓGICA
     try {
-        // Configurar variable de entorno para ADC
-        if (IS_LOCAL && fs.existsSync(KEY_FILE_PATH)) {
-            process.env.GOOGLE_APPLICATION_CREDENTIALS = KEY_FILE_PATH;
-            console.log(`   🔧 Estableciendo GOOGLE_APPLICATION_CREDENTIALS: ${KEY_FILE_PATH}`);
+        let storageConfig = { projectId: GOOGLE_CLOUD_PROJECT };
+
+        // OPCIÓN 1: Si existe archivo de credenciales, usarlo
+        if (fs.existsSync(LOCAL_CREDENTIALS_PATH)) {
+            console.log('🔑 Usando credenciales de archivo');
+            console.log(`   Ruta: ${LOCAL_CREDENTIALS_PATH}`);
+
+            storageConfig.keyFilename = LOCAL_CREDENTIALS_PATH;
+
+            // Leer para mostrar info
+            try {
+                const keyContent = JSON.parse(fs.readFileSync(LOCAL_CREDENTIALS_PATH, 'utf8'));
+                console.log(`   📧 Cuenta: ${keyContent.client_email}`);
+                storageConfig.projectId = keyContent.project_id || GOOGLE_CLOUD_PROJECT;
+            } catch (e) {
+                console.warn(`   ⚠️  No se pudo leer archivo: ${e.message}`);
+            }
+        }
+        // OPCIÓN 2: Compute Engine sin archivo -> usar ADC
+        else if (IS_COMPUTE_ENGINE) {
+            console.log('🌐 Compute Engine: Usando Application Default Credentials');
+        }
+        // OPCIÓN 3: Cloud Run -> usar ADC
+        else if (IS_CLOUD_RUN) {
+            console.log('☁️  Cloud Run: Usando Application Default Credentials');
+        }
+        // OPCIÓN 4: Local sin archivo -> intentar ADC
+        else {
+            console.log('💻 Local: Intentando Application Default Credentials');
+            if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+                console.log(`   Variable de entorno: ${process.env.GOOGLE_APPLICATION_CREDENTIALS}`);
+            }
         }
 
-        const storageInstance = new Storage({
-            projectId: GOOGLE_CLOUD_PROJECT
-        });
+        const storageInstance = new Storage(storageConfig);
 
         // Verificar que funciona
         const [buckets] = await storageInstance.getBuckets();
         console.log(`✅ Storage inicializado. Buckets disponibles: ${buckets.length}`);
+        console.log(`   Proyecto: ${storageInstance.projectId}`);
+
         return storageInstance;
 
     } catch (error) {
-        console.error('❌ Error con Application Default Credentials:', error.message);
+        console.error('❌ Error inicializando Storage:', error.message);
 
-        // OPCIÓN 3: Usar autenticación directa con GoogleAuth
-        console.log('🔄 Intentando autenticación directa...');
-        try {
-            const auth = new GoogleAuth({
-                keyFile: KEY_FILE_PATH,
-                scopes: ['https://www.googleapis.com/auth/cloud-platform']
-            });
-
-            const client = await auth.getClient();
-            const projectId = await auth.getProjectId();
-
-            console.log(`   🔑 Autenticado como proyecto: ${projectId}`);
-
-            return new Storage({
-                projectId: projectId,
-                authClient: client
-            });
-
-        } catch (authError) {
-            console.error('❌ Todas las opciones de autenticación fallaron:', authError.message);
-            throw new Error('No se pudo autenticar con Google Cloud Storage');
+        // Intento de fallback para Compute Engine
+        if (IS_COMPUTE_ENGINE) {
+            console.log('🔄 Intentando configuración mínima para Compute Engine...');
+            try {
+                const fallbackStorage = new Storage({
+                    projectId: GOOGLE_CLOUD_PROJECT
+                });
+                console.log('✅ Storage fallback inicializado');
+                return fallbackStorage;
+            } catch (fallbackError) {
+                console.error('❌ Fallback también falló:', fallbackError.message);
+            }
         }
+
+        throw error;
     }
 }
 
 async function initializeGoogleCloudServices() {
     try {
         console.log('🚀 Inicializando servicios Google Cloud...');
-
-        // 🔥 DETECTAR ENTORNO
-        const IS_CLOUD_RUN = process.env.K_SERVICE !== undefined;
-        console.log(`   📍 Entorno: ${IS_CLOUD_RUN ? 'Cloud Run' : 'Local'}`);
+        console.log(`   📍 Entorno: ${IS_COMPUTE_ENGINE ? 'Compute Engine VM' : IS_CLOUD_RUN ? 'Cloud Run' : 'Local'}`);
         console.log(`   📍 Proyecto: ${GOOGLE_CLOUD_PROJECT}`);
+        console.log(`   📍 Credenciales: ${fs.existsSync(LOCAL_CREDENTIALS_PATH) ? 'Archivo' : 'ADC'}`);
 
         // 1. STORAGE
         storage = await initializeStorageWithRetry();
@@ -347,15 +402,18 @@ async function initializeGoogleCloudServices() {
         firestore = await initializeFirestoreWithRetry();
         console.log('✅ Firestore inicializado');
 
-        // 3. PUBSUB
-        if (IS_CLOUD_RUN) {
+        // 3. PUBSUB - MODIFICAR
+        if (IS_CLOUD_RUN || IS_COMPUTE_ENGINE) {
+            console.log('🌐 Inicializando PubSub con ADC...');
             pubsub = new PubSub({ projectId: GOOGLE_CLOUD_PROJECT });
         } else if (fs.existsSync(LOCAL_CREDENTIALS_PATH)) {
+            console.log('🔑 Inicializando PubSub con archivo de credenciales...');
             pubsub = new PubSub({
                 projectId: GOOGLE_CLOUD_PROJECT,
                 keyFilename: LOCAL_CREDENTIALS_PATH
             });
         } else {
+            console.log('⚠️  PubSub en modo mock (sin credenciales)');
             pubsub = { topic: () => ({ publishMessage: async () => { } }) };
         }
         console.log('✅ PubSub inicializado');
@@ -376,6 +434,7 @@ async function initializeGoogleCloudServices() {
             }
         } catch (bucketError) {
             console.error(`⚠️  Error con bucket: ${bucketError.message}`);
+            // No fallar si es solo verificación
         }
 
         console.log('🎉 Todos los servicios inicializados correctamente');
@@ -384,19 +443,24 @@ async function initializeGoogleCloudServices() {
     } catch (error) {
         console.error('❌ Error inicializando servicios:', error.message);
 
-        // Fallback mínimo
-        console.log('⚠️  Usando servicios de fallback limitados');
+        // Manejo especial para Compute Engine
+        if (IS_COMPUTE_ENGINE) {
+            console.log('⚠️  Usando servicios de fallback para Compute Engine');
 
-        try {
-            storage = new Storage({ projectId: GOOGLE_CLOUD_PROJECT });
-        } catch (e) {
-            storage = null;
+            try {
+                storage = new Storage({ projectId: GOOGLE_CLOUD_PROJECT });
+            } catch (e) {
+                storage = null;
+            }
+
+            firestore = createMockFirestore();
+            pubsub = { topic: () => ({ publishMessage: async () => { } }) };
+
+            return false; // Continuar con servicios limitados
         }
 
-        firestore = createMockFirestore();
-        pubsub = { topic: () => ({ publishMessage: async () => { } }) };
-
-        return false;
+        // Para local, propagar error
+        throw error;
     }
 }
 
@@ -1678,65 +1742,86 @@ async function runPollingCycle() {
             console.log('⏰ CICLO DE POLLING');
             console.log('⏰ ========================================');
 
-            const IS_CLOUD_RUN = process.env.K_SERVICE !== undefined;
-            console.log(`📍 Entorno: ${IS_CLOUD_RUN ? 'Cloud Run' : 'Local'}`);
+            // 🔥 USAR LAS CONSTANTES GLOBALES QUE DEFINIMOS ARRIBA
+            console.log(`📍 Entorno: ${IS_COMPUTE_ENGINE ? 'Compute Engine VM' : IS_CLOUD_RUN ? 'Cloud Run' : 'Local'}`);
 
-            // 🔥 OBTENER TOKEN - CORREGIDO
+            // 🔥 OBTENER TOKEN - VERSIÓN COMPLETA CON DETECCIÓN DE COMPUTE ENGINE
             let token;
             try {
-                if (IS_CLOUD_RUN) {
-                    // CLOUD RUN: Application Default Credentials
-                    console.log('🔑 Usando ADC para Cloud Run');
-                    const auth = new GoogleAuth({
+                let auth;
+
+                if (IS_CLOUD_RUN || IS_COMPUTE_ENGINE) {
+                    // CLOUD RUN o COMPUTE ENGINE: Application Default Credentials
+                    console.log('🔑 Usando Application Default Credentials');
+                    auth = new GoogleAuth({
                         scopes: ['https://www.googleapis.com/auth/drive.readonly'],
                         projectId: GOOGLE_CLOUD_PROJECT
                     });
+
                     const client = await auth.getClient();
                     const tokenResponse = await client.getAccessToken();
                     token = tokenResponse.token;
+
+                    console.log(`✅ Token ADC obtenido (${token?.length || 0} caracteres)`);
+
                 } else {
                     // LOCAL: Archivo de credenciales
-                    console.log('🔑 Usando credenciales locales');
+                    console.log('🔑 Usando credenciales de archivo');
+
                     if (!fs.existsSync(LOCAL_CREDENTIALS_PATH)) {
-                        console.error('❌ Archivo gcs-key.json no encontrado');
+                        console.error('❌ Archivo gcs-key.json no encontrado en local');
+                        console.log('   Saliendo de ciclo de polling para local');
                         setTimeout(executePolling, POLLING_INTERVAL);
                         return;
                     }
-                    const auth = new GoogleAuth({
+
+                    auth = new GoogleAuth({
                         keyFile: LOCAL_CREDENTIALS_PATH,
                         scopes: ['https://www.googleapis.com/auth/drive.readonly']
                     });
+
                     const client = await auth.getClient();
                     const tokenResponse = await client.getAccessToken();
                     token = tokenResponse.token;
+
+                    console.log(`✅ Token de archivo obtenido (${token?.length || 0} caracteres)`);
                 }
 
                 if (!token) {
                     throw new Error('No se pudo obtener token de acceso');
                 }
 
-                console.log(`✅ Token obtenido`);
-
             } catch (tokenError) {
                 console.error(`❌ ERROR obteniendo token: ${tokenError.message}`);
 
-                // Manejo específico de error 401
-                if (tokenError.message.includes('401') || tokenError.message.includes('invalid_grant')) {
-                    if (IS_CLOUD_RUN) {
-                        console.error('🔐 ERROR 401 EN CLOUD RUN:');
-                        console.error('   Verificar permisos de Drive para la Service Account');
-                    } else {
-                        console.error('🔐 ERROR 401 EN LOCAL:');
-                        console.error('   Verificar que gcs-key.json sea válido');
+                // Manejo específico para Compute Engine
+                if (IS_COMPUTE_ENGINE) {
+                    if (tokenError.message.includes('403') || tokenError.message.includes('PERMISSION_DENIED')) {
+                        console.error('🔐 ERROR 403 EN COMPUTE ENGINE:');
+                        console.error('   La Service Account de la VM no tiene permisos de Drive');
+                        console.error('   Solución: Compartir carpetas de Drive con:');
+                        console.error(`       594761951101-compute@developer.gserviceaccount.com`);
+                        console.error('   O crear una service account específica con permisos de Drive');
+                    } else if (tokenError.message.includes('401') || tokenError.message.includes('invalid_grant')) {
+                        console.error('🔐 ERROR 401 EN COMPUTE ENGINE:');
+                        console.error('   Credenciales inválidas o expiradas');
+                        console.error('   Solución: Verificar la service account de la VM');
                     }
+                } else if (IS_CLOUD_RUN) {
+                    console.error('🔐 ERROR EN CLOUD RUN:');
+                    console.error('   Verificar permisos de Drive para la Service Account de Cloud Run');
+                } else {
+                    console.error('🔐 ERROR EN LOCAL:');
+                    console.error('   Verificar que gcs-key.json sea válido y tenga permisos de Drive');
                 }
 
-                // Reintentar en 2 minutos si es error 401
+                // Reintentar en 2 minutos si es error de permisos
+                console.log('🔄 Reintentando en 2 minutos...');
                 setTimeout(executePolling, 120000);
                 return;
             }
 
-            // 🔥 OBTENER ÚLTIMA SINCRONIZACIÓN - CORREGIDO
+            // 🔥 OBTENER ÚLTIMA SINCRONIZACIÓN
             let lastRun;
             try {
                 lastRun = await getLastSyncTime();
@@ -1748,40 +1833,61 @@ async function runPollingCycle() {
                 }
 
                 console.log(`📅 Última sincronización: ${lastRun}`);
+                console.log(`⏱️  Hora actual: ${new Date().toISOString()}`);
 
             } catch (syncError) {
                 console.error(`⚠️  Error obteniendo lastSyncTime: ${syncError.message}`);
                 lastRun = '2000-01-01T00:00:00.000Z';
+
+                // Si es Compute Engine y falla Firestore, continuar de todos modos
+                if (IS_COMPUTE_ENGINE) {
+                    console.log('ℹ️  Compute Engine: Continuando con fecha por defecto');
+                }
             }
 
             // 🔥 EJECUTAR SINCRONIZACIÓN
             console.log(`🔍 Buscando cambios desde: ${lastRun}`);
             const startTime = Date.now();
 
-            const stats = await processFolderIncremental(ROOT_FOLDER_ID, "", token, lastRun);
+            try {
+                const stats = await processFolderIncremental(ROOT_FOLDER_ID, "", token, lastRun);
+                const elapsedTime = Date.now() - startTime;
 
-            const elapsedTime = Date.now() - startTime;
-
-            // 🔥 ACTUALIZAR REGISTRO SI HUBO ÉXITOS
-            if (stats.ok > 0) {
-                const newSyncTime = new Date().toISOString();
-                try {
-                    await setLastSyncTime(newSyncTime);
-                    console.log(`💾 Nuevo lastSyncTime guardado: ${newSyncTime}`);
-                } catch (saveError) {
-                    console.error(`⚠️  Error guardando lastSyncTime: ${saveError.message}`);
+                // 🔥 ACTUALIZAR REGISTRO SI HUBO ÉXITOS
+                if (stats.ok > 0) {
+                    const newSyncTime = new Date().toISOString();
+                    try {
+                        await setLastSyncTime(newSyncTime);
+                        console.log(`💾 Nuevo lastSyncTime guardado: ${newSyncTime}`);
+                    } catch (saveError) {
+                        console.error(`⚠️  Error guardando lastSyncTime: ${saveError.message}`);
+                        if (IS_COMPUTE_ENGINE) {
+                            console.log('ℹ️  Compute Engine: Error Firestore, continuando...');
+                        }
+                    }
                 }
-            }
 
-            // 🔥 MOSTRAR RESULTADOS
-            console.log('\n📊 ========================================');
-            console.log('📊 RESUMEN DEL CICLO');
-            console.log('📊 ========================================');
-            console.log(`✅ Archivos sincronizados: ${stats.ok}`);
-            console.log(`❌ Archivos fallados: ${stats.fail}`);
-            console.log(`📁 Carpetas procesadas: ${stats.folders}`);
-            console.log(`⏱️  Tiempo total: ${(elapsedTime / 1000).toFixed(2)} segundos`);
-            console.log(`📅 Finalizado: ${new Date().toLocaleTimeString()}`);
+                // 🔥 MOSTRAR RESULTADOS
+                console.log('\n📊 ========================================');
+                console.log('📊 RESUMEN DEL CICLO');
+                console.log('📊 ========================================');
+                console.log(`✅ Archivos sincronizados: ${stats.ok}`);
+                console.log(`❌ Archivos fallados: ${stats.fail}`);
+                console.log(`📁 Carpetas procesadas: ${stats.folders}`);
+                console.log(`⏱️  Tiempo total: ${(elapsedTime / 1000).toFixed(2)} segundos`);
+                console.log(`📅 Finalizado: ${new Date().toLocaleTimeString()}`);
+
+            } catch (syncError) {
+                console.error(`❌ ERROR en sincronización: ${syncError.message}`);
+
+                // Manejo específico para Compute Engine
+                if (IS_COMPUTE_ENGINE) {
+                    console.log('ℹ️  Compute Engine: Error en sincronización, continuando ciclo...');
+                }
+
+                const elapsedTime = Date.now() - startTime;
+                console.log(`⏱️  Tiempo transcurrido: ${(elapsedTime / 1000).toFixed(2)} segundos`);
+            }
 
             // 🔥 PROGRAMAR SIGUIENTE CICLO
             console.log(`\n⏰ Próximo ciclo en ${POLLING_INTERVAL / 1000} segundos...`);
@@ -1789,22 +1895,31 @@ async function runPollingCycle() {
 
         } catch (error) {
             console.error(`\n❌ ERROR en ciclo de polling: ${error.message}`);
+            console.error('Stack:', error.stack);
 
             // Manejo específico de error 401
             if (error.message.includes('401')) {
                 console.log('🔄 Error 401 detectado, reintentando en 2 minutos...');
                 setTimeout(executePolling, 120000);
-            } else {
+            }
+            // Manejo para Compute Engine con errores de red
+            else if (IS_COMPUTE_ENGINE && error.message.includes('network') || error.message.includes('timeout')) {
+                console.log('🌐 Compute Engine: Error de red, reintentando en 1 minuto...');
+                setTimeout(executePolling, 60000);
+            }
+            else {
                 console.log(`🔄 Reintentando en ${POLLING_INTERVAL / 1000} segundos...`);
                 setTimeout(executePolling, POLLING_INTERVAL);
             }
         }
     }
 
-    // ✅ CORRECTO: Iniciar después de 5 segundos
+    // ✅ Iniciar después de 5 segundos
     setTimeout(() => {
         executePolling().catch(err => {
             console.error('❌ Error fatal al iniciar polling:', err);
+            // Reintentar inicio en caso de error fatal
+            setTimeout(runPollingCycle, 30000);
         });
     }, 5000);
 }
